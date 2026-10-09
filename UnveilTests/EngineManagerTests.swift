@@ -62,6 +62,20 @@ struct EngineManagerTests {
         try await waitUntil(seconds: 30) { (manager.frames.latest()?.generation ?? 0) >= generation }
     }
 
+    /// The everyday reopen: the same path again is a "path" duplicate, opened without a relink.
+    @Test
+    func reopeningTheSamePathSelectsTheSamePhotoAndRenders() async throws {
+        let manager = try makeManager(maxPixels: 256)
+        let file    = try fixtureURL()
+
+        let first      = try await manager.openPhoto(at: file)
+        let second     = try await manager.openPhoto(at: file)
+        let generation = try manager.requestPreview(maxPixels: 256, draft: false)
+
+        #expect(second == first)
+        try await waitUntil(seconds: 30) { (manager.frames.latest()?.generation ?? 0) >= generation }
+    }
+
     @Test
     func currentValuesReportsWhatWasSet() async throws {
         let manager = try makeManager(maxPixels: 256)

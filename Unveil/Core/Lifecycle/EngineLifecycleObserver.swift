@@ -47,7 +47,7 @@ nonisolated final class EngineLifecycleObserver<Engine: EngineDriving> {
             queue   : nil
         ) { _ in
             do    { try engine.suspend() }
-            catch { logger.error("Engine suspend failed: \(String(describing: error))") }
+            catch { logger.error("Engine suspend failed: \(String(describing: error), privacy: .public)") }
         })
 
         tokens.append(notificationCenter.addObserver(
@@ -56,7 +56,7 @@ nonisolated final class EngineLifecycleObserver<Engine: EngineDriving> {
             queue   : nil
         ) { _ in
             do    { try engine.resume() }
-            catch { logger.error("Engine resume failed: \(String(describing: error))") }
+            catch { logger.error("Engine resume failed: \(String(describing: error), privacy: .public)") }
         })
     }
 }

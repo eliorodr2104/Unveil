@@ -60,9 +60,12 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
         let duplicates: [Duplicate]
         let failed    : [[String]]
 
+        /// Duplicate names the photo that already has the file. `reason` is "path" when that photo
+        /// was imported from this very path, "content" when the same bytes live elsewhere.
         struct Duplicate: Decodable {
 
             let existing: UInt64?
+            let reason  : String
         }
     }
 
@@ -105,8 +108,15 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
         guard maxPixels > 0 else { throw .invalidArgument("maxPixels must be positive, got \(maxPixels)") }
         guard let device = MTLCreateSystemDefaultDevice() else { throw .engine("no Metal device") }
 
+        // Out of the iCloud backup, like the Imports copies its records point at: the edits it holds
+        // are therefore not backed up either (a v0 trade-off, by ruling).
         do {
-            try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+            var directory = dataDirectory
+            var noBackup  = URLResourceValues()
+            noBackup.isExcludedFromBackup = true
+
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try directory.setResourceValues(noBackup)
         } catch {
             throw .io("cannot create \(dataDirectory.path(percentEncoded: false)): \(error.localizedDescription)")
         }
@@ -141,6 +151,8 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
     /// An existing record is relinked to `fileURL` before it is selected: iOS gives the app a new
     /// data container when it is reinstalled, so the path the library stored may no longer exist,
     /// and a render of it would never deliver a frame. The copy just imported is the live file.
+    /// A "path" duplicate is not relinked: the record already points at `fileURL`, and a relink
+    /// would only re-hash the whole file (about 286 ms on a 46 MP NEF).
     /// A file the engine cannot read still returns UV_OK, with the reason in `failed`: that is
     /// how an unreadable file becomes an error here.
     func openPhoto(at fileURL: URL) async throws(EngineError) -> PhotoID {
@@ -158,13 +170,21 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
                 throw .engine("nothing imported")
             }
 
-            if report.imported.isEmpty {
+            if report.imported.isEmpty, report.duplicates.first?.reason != "path" {
                 let relink = RelinkRequest(id: id, path: fileURL.path(percentEncoded: false))
                 _ = try self.execute("photo.relink", relink)
             }
 
             _ = try self.execute("library.select", SelectRequest(ids: [id], active: id))
             return PhotoID(rawValue: id)
+        }
+    }
+
+    /// select makes `photo` the active photo. The editor uses it to put the engine back on the
+    /// photo it still shows when an open fails halfway.
+    func select(_ photo: PhotoID) async throws(EngineError) {
+        try await onQueue { () throws(EngineError) in
+            _ = try self.execute("library.select", SelectRequest(ids: [photo.rawValue], active: photo.rawValue))
         }
     }
 

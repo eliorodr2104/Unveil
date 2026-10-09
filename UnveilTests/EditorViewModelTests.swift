@@ -77,6 +77,46 @@ struct EditorViewModelTests {
         #expect(model.values[.temperature] == DevelopAdjustmentKind.temperature.defaultValue)
     }
 
+    /// The engine opened the new photo but its values could not be read: the model keeps the first
+    /// photo and its values, and the engine is put back on it, with no preview of the new one.
+    @Test
+    func anOpenThatFailsHalfwayLeavesBothOnThePreviousPhoto() async {
+        let engine = FakeEngine()
+        engine.storedValues = [.exposure: 1.5]
+        let model  = EditorViewModel(engine: engine, importer: FakeImporter(), previewPixels: 1024)
+
+        await model.open(pickedURL: URL(filePath: "/tmp/x.ARW"))
+        engine.failNextValues = .timeout("develop.controls timed out")
+        engine.storedValues   = [.exposure: -2]
+        await model.open(pickedURL: URL(filePath: "/tmp/y.ARW"))
+
+        #expect(model.openPhoto == PhotoID(rawValue: 1))
+        #expect(model.values[.exposure] == 1.5)
+        #expect(model.errorMessage?.contains("timed out") == true)
+        #expect(engine.calls == ["open /tmp/x.ARW", "preview 1024 full", "open /tmp/y.ARW", "select 1"])
+    }
+
+    /// A failed open must not leave its copy behind: the real importer, on a folder of its own.
+    @Test
+    func aFailedOpenLeavesNoCopy() async throws {
+        let imports = FileManager.default.temporaryDirectory.appending(path: "imports-\(UUID())")
+        let picked  = FileManager.default.temporaryDirectory.appending(path: "picked-\(UUID()).ARW")
+        try Data(UUID().uuidString.utf8).write(to: picked)
+
+        let engine = FakeEngine()
+        engine.failNextOpen = .engine("unsupported camera")
+        let model  = EditorViewModel(
+            engine        : engine,
+            importer      : PhotoImporter(importsDirectory: imports),
+            previewPixels : 1024
+        )
+
+        await model.open(pickedURL: picked)
+
+        #expect(model.openPhoto == nil)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: imports.path(percentEncoded: false)).isEmpty)
+    }
+
     /// The drags and the release are started without awaiting each other, like a finger that moves
     /// faster than the engine. FakeEngine.set yields, so an unchained release would run ahead, and
     /// the stale drags must collapse into far fewer than 40 `set` calls.

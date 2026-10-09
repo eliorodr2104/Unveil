@@ -20,6 +20,8 @@ final class FakeEngine: EngineDriving {
         var previewCounter  : UInt64   = 0
         var calls           : [String] = []
         var failNextOpen    : EngineError?
+        var failNextValues  : EngineError?
+        var openedPhotos    : UInt64   = 0
         var storedValues    : [DevelopAdjustmentKind: Double] = [:]
     }
 
@@ -30,14 +32,20 @@ final class FakeEngine: EngineDriving {
     var budgets  : [UInt64] { state.withLock { $0.budgets } }
     var lifecycle: [String] { state.withLock { $0.lifecycle } }
 
-    /// Every openPhoto, set and requestPreview in order, as "open <path>", "set <id> <value>" and
-    /// "preview <pixels> draft|full".
+    /// Every openPhoto, select, set and requestPreview in order, as "open <path>", "select <id>",
+    /// "set <id> <value>" and "preview <pixels> draft|full".
     var calls: [String] { state.withLock { $0.calls } }
 
     /// The error the next openPhoto throws, once. It clears itself when thrown.
     var failNextOpen: EngineError? {
         get { state.withLock { $0.failNextOpen } }
         set { state.withLock { $0.failNextOpen = newValue } }
+    }
+
+    /// The error the next currentValues throws, once, like a read that times out after a good open.
+    var failNextValues: EngineError? {
+        get { state.withLock { $0.failNextValues } }
+        set { state.withLock { $0.failNextValues = newValue } }
     }
 
     /// The values currentValues reports on top of the kind defaults, like a photo reopened with saved settings.
@@ -47,27 +55,44 @@ final class FakeEngine: EngineDriving {
     }
 
     func currentValues() async throws(EngineError) -> [DevelopAdjustmentKind: Double] {
-        let stored = storedValues
-
-        return Dictionary(uniqueKeysWithValues: DevelopAdjustmentKind.allCases.map {
-            ($0, stored[$0] ?? $0.defaultValue)
-        })
-    }
-
-    func openPhoto(at fileURL: URL) async throws(EngineError) -> PhotoID {
-        let failure = state.withLock {
-            $0.calls.append("open \(fileURL.path)")
-
-            let failure = $0.failNextOpen
-            $0.failNextOpen = nil
-            return failure
+        let (stored, failure) = state.withLock {
+            let failure = $0.failNextValues
+            $0.failNextValues = nil
+            return ($0.storedValues, failure)
         }
 
         if let failure {
             throw failure
         }
 
-        return PhotoID(rawValue: 1)
+        return Dictionary(uniqueKeysWithValues: DevelopAdjustmentKind.allCases.map {
+            ($0, stored[$0] ?? $0.defaultValue)
+        })
+    }
+
+    /// openPhoto hands out ids 1, 2, 3... one per successful open, so a test can tell photos apart.
+    func openPhoto(at fileURL: URL) async throws(EngineError) -> PhotoID {
+        let (failure, id) = state.withLock {
+            $0.calls.append("open \(fileURL.path)")
+
+            let failure = $0.failNextOpen
+            $0.failNextOpen = nil
+
+            if failure == nil {
+                $0.openedPhotos += 1
+            }
+            return (failure, $0.openedPhotos)
+        }
+
+        if let failure {
+            throw failure
+        }
+
+        return PhotoID(rawValue: id)
+    }
+
+    func select(_ photo: PhotoID) async throws(EngineError) {
+        state.withLock { $0.calls.append("select \(photo.rawValue)") }
     }
 
     /// Yields once after recording, like a real `set` that is still queued when the caller moves on:

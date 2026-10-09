@@ -19,10 +19,15 @@ import Synchronization
 ///
 /// Why the suspend event matters: `uv_resume` clears the engine's last GPU fallback, so a fallback
 /// that happened while the app was in the background is only visible between suspend and resume.
+///
+/// Every suspend writes a line, so the file is rotated rather than left to grow for the life of the
+/// install: past `rotationBytes` it becomes `engine.jsonl.1` (replacing the older one) and a new
+/// file starts. At most two files, about 512 KB, and the newest lines are always kept.
 nonisolated enum EngineStateLog {
 
-    private static let fileLock = Mutex(())
-    private static let logger   = Logger(subsystem: "com.eliorodr2104.unveil", category: "EngineState")
+    private static let fileLock      = Mutex(())
+    private static let logger        = Logger(subsystem: "com.eliorodr2104.unveil", category: "EngineState")
+    private static let rotationBytes = 256 * 1024
 
     /// fileURL is `Documents/diagnostics/engine.jsonl`, reachable from the Files app.
     static var fileURL: URL {
@@ -83,6 +88,15 @@ nonisolated enum EngineStateLog {
             at                          : url.deletingLastPathComponent(),
             withIntermediateDirectories : true
         )
+
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+
+        if size > rotationBytes {
+            let previous = url.appendingPathExtension("1")
+
+            try? fileManager.removeItem(at: previous)   // Absent before the first rotation.
+            try fileManager.moveItem(at: url, to: previous)
+        }
 
         if !fileManager.fileExists(atPath: url.path(percentEncoded: false)) {
             try Data().write(to: url)

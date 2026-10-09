@@ -191,7 +191,7 @@ nonisolated struct GoldenExporter<Engine: EngineDriving & EngineDiagnosing>: Sen
             }
 
             guard ContinuousClock.now < deadline else {
-                throw EngineError.timeout("no full frame for generation \(generation) within 120 s")
+                throw EngineError.timeout("no full frame for generation \(generation) within \(Self.renderTimeout)")
             }
 
             try await Task.sleep(for: .milliseconds(20))

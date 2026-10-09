@@ -18,6 +18,10 @@ nonisolated protocol EngineDriving: AnyObject, Sendable {
     var frames: FrameSink { get }
 
     func openPhoto(at fileURL: URL) async throws(EngineError) -> PhotoID
+
+    /// Makes a photo of the library the active one again, without importing anything.
+    func select(_ photo: PhotoID) async throws(EngineError)
+
     func set(_ adjustment: DevelopAdjustmentKind, to value: Double) async throws(EngineError)
 
     /// The current value of each develop control of the active photo, as the engine holds it: the

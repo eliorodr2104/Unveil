@@ -72,6 +72,7 @@ Reading: the first preview render takes about 0.45 to 0.5 s for both sizes. For 
 (about 340 ms) is the second big piece, and the warm open is slower than the cold one by the `photo.relink` command
 (about 286 ms), which cold does not run. The user's "open feels slow" is therefore about 0.9 s cold and 1.1 s warm on the
 NEF, of which more than 0.7 s is engine import, relink and the preview render.
+Note: the warm figures were measured before the import-copy fix (I1 of the final review): reopening a file now reuses its content-named copy, a "path" duplicate, so the `photo.relink` re-hash above (about 286 ms on the NEF) no longer runs and the copy step now hashes the file instead; the warm rows were not re-measured.
 `Command` and `ShaderCompile` intervals are in the same traces (`ShaderCompile` 0.2 ms; the launch `app.gpu` read
 15.7 to 17.1 ms happens before the open's timer starts, per M3.4).
 

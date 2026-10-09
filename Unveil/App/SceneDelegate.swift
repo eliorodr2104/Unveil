@@ -52,6 +52,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
               let device = MTLCreateSystemDefaultDevice()
         else {
             let reason = appDelegate?.engineError?.message ?? "This device has no Metal GPU."
+            exitIfAgentDriven(reason: reason)
+
             return makeUnavailableViewController(reason: reason)
         }
 
@@ -168,6 +170,19 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
 
         return false
+    }
+
+    /// exitIfAgentDriven ends the process with `exit(1)` when a launch argument asked for an
+    /// agent-driven run (`-UnveilRun`, `-UnveilOpen`) and the engine is not there to run it: the
+    /// devicectl caller then sees the failure at once instead of waiting for its own timeout.
+    private func exitIfAgentDriven(reason: String) {
+        let isAgentDriven = UserDefaults.standard.string(forKey: "UnveilRun") != nil
+            || MeasurementLaunchOptions(arguments: ProcessInfo.processInfo.arguments).openFileName != nil
+
+        guard isAgentDriven else { return }
+
+        print("engine unavailable: \(reason)")
+        exit(1)
     }
 
     /// makeUnavailableViewController is the screen shown when the engine did not open: without it
