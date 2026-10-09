@@ -1108,7 +1108,7 @@ L'autore fa il push. Gli si chiede anche se è il momento di creare il repositor
    - Minimum Deployments **iPadOS 26.0**.
 3. Signing & Capabilities:
    - scegliere il Team;
-   - **+ Capability**: *Increased Memory Limit* ed *Extended Virtual Addressing*. Se una delle due non è disponibile con il team personale, annotarlo e proseguire: il coordinatore aggiorna la spec.
+   - **+ Capability**: solo *Increased Memory Limit*; *Extended Virtual Addressing* non è firmabile con il team personale e torna con un team a pagamento. Se la prima non è disponibile, annotarlo e proseguire: il coordinatore aggiorna la spec.
 4. Trascinare `Frameworks/UnveilEngine.xcframework` (eseguire prima `scripts/build-xcframework.sh`) nel target, con **Do Not Embed**.
 5. Project → Info → Configurations: per Debug e Release del target Unveil, impostare `Config/UnveilEngine.xcconfig` come file di configurazione.
 6. Chiudere Xcode.

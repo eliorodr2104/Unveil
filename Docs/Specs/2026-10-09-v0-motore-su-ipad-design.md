@@ -113,7 +113,7 @@ void        uv_set_memory_budget(UVSession*, uint64_t bytes);
   - `CanvasView` è una vista con `CAMetalLayer`. Un piccolo shader disegna il buffer condiviso come texture, e pinch e pan sono una trasformazione applicata nello shader. Ridisegna solo quando arriva una nuova generazione o cambia lo zoom, mai in un ciclo continuo.
   - L'`EditorViewController` è generico sul motore: `EditorViewController<Engine: EngineDriving>`, così il dispatch resta statico.
 - **`AdjustmentPanel`** (`Components/Adjustments/`): un pannello SwiftUI dentro un `UIHostingController`.
-- **Entitlement** (nel file `.entitlements`, non nell'`Info.plist`): `increased-memory-limit` ed `extended-virtual-addressing`. Alzano il limite di memoria senza dire di quanto, quindi il budget resta quello calcolato su `os_proc_available_memory()`. Il piano deve verificare che siano disponibili con il team di firma usato.
+- **Entitlement** (nel file `.entitlements`, non nell'`Info.plist`): in v0 solo `increased-memory-limit`, perché i team personali non supportano `extended-virtual-addressing`, che torna con un team a pagamento dell'Apple Developer Program. Alza il limite di memoria senza dire di quanto, quindi il budget resta quello calcolato su `os_proc_available_memory()`. Il piano deve verificare che sia disponibile con il team di firma usato.
 - **Background:** iOS non permette alle app in background di usare la GPU per le anteprime, e nessuna chiave del plist o thread dedicato cambia le cose. Per l'export futuro si valuterà `BGContinuedProcessingTask` con la risorsa GPU (iPadOS 26), che richiede un entitlement e un dispositivo supportato, da verificare sull'M2. Fuori perimetro v0.
 
 ## 5. Rischi noti e mitigazioni
