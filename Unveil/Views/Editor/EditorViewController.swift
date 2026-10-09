@@ -27,6 +27,8 @@ final class EditorViewController<Engine: EngineDriving & EngineDiagnosing, Impor
     private let engine   : Engine
     private let canvas   : CanvasView
 
+    private var soakTest: StressSweep<Engine, Importer>?
+
     init(
         viewModel: EditorViewModel<Engine, Importer>,
         engine   : Engine,
@@ -127,7 +129,8 @@ final class EditorViewController<Engine: EngineDriving & EngineDiagnosing, Impor
             engine            : engine,
             isPhotoOpen       : { [viewModel] in viewModel.isPhotoOpen },
             possibleTearCount : { [canvas] in canvas.possibleTearCount },
-            present           : { [weak self] alert in self?.present(alert, animated: true) }
+            present           : { [weak self] alert in self?.present(alert, animated: true) },
+            startSoakTest     : { [weak self] in self?.startSoakTest() }
         )
 
         let diagnostics = UIBarButtonItem(
@@ -137,6 +140,29 @@ final class EditorViewController<Engine: EngineDriving & EngineDiagnosing, Impor
         )
 
         navigationItem.leftBarButtonItems = [open, diagnostics]
+    }
+
+    /// startSoakTest runs the 10-minute StressSweep on the open photo. It does nothing with no photo
+    /// open, or while a sweep already runs, and shows where the CSV went when the sweep ends.
+    private func startSoakTest() {
+        guard viewModel.isPhotoOpen, soakTest == nil else { return }
+
+        let sweep = StressSweep(viewModel: viewModel, duration: 600) { [weak self] isComplete, csv in
+            self?.soakTest = nil
+
+            let title = isComplete ? "Soak test finished" : "Soak test stopped early"
+            let alert = UIAlertController(
+                title          : title,
+                message        : "Memory samples: Documents/measurements/\(csv.lastPathComponent)",
+                preferredStyle : .alert
+            )
+
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            self?.present(alert, animated: true)
+        }
+
+        soakTest = sweep
+        sweep.start()
     }
 
     /// presentDocumentPicker opens the Files picker on the original file, not a copy: PhotoImporter

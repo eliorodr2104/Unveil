@@ -5,6 +5,7 @@
 
 import Foundation
 import Metal
+import os
 import UnveilEngine
 
 /// EngineManager is the only door to the engine: no other type calls `uv_*`. It owns the session
@@ -225,7 +226,10 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
             Unmanaged.passUnretained(frames).toOpaque()
         )
 
-        guard generation == 0 else { return generation }
+        guard generation == 0 else {
+            Signposts.previewRequested(generation: generation, isDraft: draft)
+            return generation
+        }
 
         // ponytail: uv_request_preview has no status code, so "suspended" is told apart by its
         // documented message; a status out-parameter in uv.h would replace the string match.
@@ -297,7 +301,15 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
     }
 
     /// execute runs one engine command and returns its JSON result. Called on the command queue only.
+    /// Each call is a `Command` signpost named after the command, so a trace shows where `open` goes.
     private func execute(_ command: String, _ params: some Encodable) throws(EngineError) -> Data {
+        let signpost = Signposts.signposter.beginInterval(
+            "Command",
+            id: Signposts.signposter.makeSignpostID(),
+            "\(command, privacy: .public)"
+        )
+        defer { Signposts.signposter.endInterval("Command", signpost) }
+
         let json: Data
         do {
             json = try JSONEncoder().encode(params)

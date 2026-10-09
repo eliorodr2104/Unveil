@@ -17,18 +17,20 @@ import UIKit
 ///
 /// "Engine state" shows `app.gpu`, `library.memory` and the canvas's possible tear count in an
 /// alert, and appends the same reading to `engine.jsonl`. "Export reference images" runs
-/// GoldenExporter and reports how it went. "10-min soak test" stays empty until T15 fills it.
+/// GoldenExporter and reports how it went. "10-min soak test" runs StressSweep for 600 s on the open
+/// photo, through the editor, which owns the sweep and reports where the memory CSV went.
 enum DiagnosticsMenu {
 
     private static let gradientSide = 512
 
     /// make builds the menu. `isPhotoOpen` and `possibleTearCount` are asked at tap time, not when the
-    /// menu is built. `present` shows an alert on the editor.
+    /// menu is built. `present` shows an alert on the editor; `startSoakTest` starts the sweep.
     static func make(
         engine           : some EngineDriving & EngineDiagnosing,
         isPhotoOpen      : @escaping @MainActor () -> Bool,
         possibleTearCount: @escaping @MainActor () -> Int,
-        present          : @escaping @MainActor (UIAlertController) -> Void
+        present          : @escaping @MainActor (UIAlertController) -> Void,
+        startSoakTest    : @escaping @MainActor () -> Void
     ) -> UIMenu {
         let frames = engine.frames
 
@@ -63,9 +65,11 @@ enum DiagnosticsMenu {
         }
 
         let soakTest = UIAction(
-            title      : "10-min soak test",
-            attributes : .disabled
-        ) { _ in }
+            title : "10-min soak test",
+            image : UIImage(systemName: "flame")
+        ) { _ in
+            startSoakTest()
+        }
 
         return UIMenu(
             title    : "Diagnostics",

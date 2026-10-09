@@ -5,6 +5,7 @@
 
 import Foundation
 import Observation
+import os
 
 /// EditorViewModel is the state of the editor: which photo is open, the ten slider values and the
 /// last error to show. The view reads it, and it drives the engine through `EngineDriving`.
@@ -58,17 +59,25 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
     /// open copies the picked file off the main actor, opens it in the engine, loads the controls'
     /// current values into the sliders and shows a full preview. A photo already in the library
     /// reopens with its saved settings, so the sliders show what the engine holds, not the defaults.
+    ///
+    /// It is the `OpenToFirstFrame` signpost's start; the interval ends when the canvas presents the
+    /// preview asked for here, or at once as `failed` when no preview was asked for.
     func open(pickedURL: URL) async {
+        let signpost = Signposts.beginOpen()
         let copy: URL
 
         do {
             copy = try await Self.importCopy(of: pickedURL, using: importer)
         } catch {
+            Signposts.openRequestedPreview(signpost, generation: nil)
             errorMessage = Self.message(for: error)
             return
         }
 
         await enqueue { [engine, previewPixels] in
+            var previewGeneration: UInt64?
+            defer { Signposts.openRequestedPreview(signpost, generation: previewGeneration) }
+
             let photo = try await engine.openPhoto(at: copy)
             self.openPhoto = photo
 
@@ -77,7 +86,7 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
             self.sent   = self.values
             self.wanted = [:]
 
-            _ = try engine.requestPreview(maxPixels: previewPixels, draft: false)
+            previewGeneration = try engine.requestPreview(maxPixels: previewPixels, draft: false)
         }
     }
 
@@ -167,9 +176,16 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
     }
 
     /// importCopy runs the importer off the main actor: copying a 50 to 100 MB RAW would stall the UI.
+    /// The copy is the `ImportCopy` signpost.
     @concurrent
     private static func importCopy(of pickedURL: URL, using importer: Importer) async throws(PhotoImportError) -> URL {
-        try importer.importCopy(of: pickedURL)
+        let signpost = Signposts.signposter.beginInterval(
+            "ImportCopy",
+            id: Signposts.signposter.makeSignpostID()
+        )
+        defer { Signposts.signposter.endInterval("ImportCopy", signpost) }
+
+        return try importer.importCopy(of: pickedURL)
     }
 
     private static func message(for error: PhotoImportError) -> String {
