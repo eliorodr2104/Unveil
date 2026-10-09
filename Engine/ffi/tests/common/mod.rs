@@ -2,6 +2,8 @@
 
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use unveil_ffi::*;
 
@@ -96,6 +98,49 @@ pub fn import_png(s: &TestSession, path: &Path) -> u64 {
 /// import_fixture imports the gradient PNG and makes it the active photo; returns its id.
 pub fn import_fixture(s: &TestSession) -> u64 {
     import_png(s, &fixture_png(s.dir.path()))
+}
+
+/// Frame is what `record` stores per delivered preview: generation, draft, w, h, stride, non-zero bytes.
+pub type Frame = (u64, bool, u32, u32, u32, usize);
+
+#[derive(Default)]
+pub struct Frames {
+    pub list: Mutex<Vec<Frame>>,
+    pub cv: Condvar,
+}
+
+pub extern "C" fn record(
+    ctx: *mut std::ffi::c_void,
+    rgba: *const u8,
+    w: u32,
+    h: u32,
+    stride: u32,
+    g: u64,
+    draft: bool,
+) {
+    // A panic here aborts the test binary, which is the failure we want for a wrong thread.
+    assert_eq!(std::thread::current().name(), Some("unveil-engine"));
+    // SAFETY: ctx is the Frames the test keeps alive in an Arc for the whole session.
+    let frames = unsafe { &*(ctx as *const Frames) };
+    assert!(!rgba.is_null());
+    // SAFETY: the engine promises stride * h readable bytes for the duration of the callback.
+    let bytes = unsafe { std::slice::from_raw_parts(rgba, (stride * h) as usize) };
+    let nonzero = bytes.iter().filter(|b| **b != 0).count();
+    frames
+        .list
+        .lock()
+        .unwrap()
+        .push((g, draft, w, h, stride, nonzero));
+    frames.cv.notify_all();
+}
+
+pub fn wait_for(frames: &Frames, n: usize) -> Vec<Frame> {
+    let list = frames.list.lock().unwrap();
+    let (list, _) = frames
+        .cv
+        .wait_timeout_while(list, Duration::from_secs(30), |l| l.len() < n)
+        .unwrap();
+    list.clone()
 }
 
 /// tempdir_lite avoids a tempfile dependency: a unique folder under the system temp dir.

@@ -1,61 +1,19 @@
 mod common;
 use common::*;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use unveil_ffi::*;
 
-type Frame = (u64, bool, u32, u32, u32, usize);
-
-#[derive(Default)]
-struct Frames {
-    list: Mutex<Vec<Frame>>,
-    cv: Condvar,
-}
-
-extern "C" fn record(
-    ctx: *mut std::ffi::c_void,
-    rgba: *const u8,
-    w: u32,
-    h: u32,
-    stride: u32,
-    g: u64,
-    draft: bool,
-) {
-    // A panic here aborts the test binary, which is the failure we want for a wrong thread.
-    assert_eq!(std::thread::current().name(), Some("unveil-engine"));
-    // SAFETY: ctx is the Frames the test keeps alive in an Arc for the whole session.
-    let frames = unsafe { &*(ctx as *const Frames) };
-    assert!(!rgba.is_null());
-    // SAFETY: the engine promises stride * h readable bytes for the duration of the callback.
-    let bytes = unsafe { std::slice::from_raw_parts(rgba, (stride * h) as usize) };
-    let nonzero = bytes.iter().filter(|b| **b != 0).count();
-    frames
-        .list
-        .lock()
-        .unwrap()
-        .push((g, draft, w, h, stride, nonzero));
-    frames.cv.notify_all();
-}
-
-fn wait_for(frames: &Frames, n: usize) -> Vec<Frame> {
-    let list = frames.list.lock().unwrap();
-    let (list, _) = frames
-        .cv
-        .wait_timeout_while(list, Duration::from_secs(30), |l| l.len() < n)
-        .unwrap();
-    list.clone()
-}
-
 fn request(s: &TestSession, max: u32, draft: bool, frames: &Arc<Frames>) -> u64 {
-    // SAFETY: s.raw is live; frames outlives the session in every test.
+    // SAFETY: s.raw is live; every test declares frames before s, so it outlives the session.
     unsafe { uv_request_preview(s.raw, max, draft, Some(record), Arc::as_ptr(frames) as *mut _) }
 }
 
 #[test]
 fn a_preview_arrives_with_sane_geometry() {
+    let frames = Arc::new(Frames::default());
     let s = TestSession::new();
     import_fixture(&s);
-    let frames = Arc::new(Frames::default());
     let g = request(&s, 512, false, &frames);
     assert!(g >= 1, "{}", last_error());
     let got = wait_for(&frames, 1);
@@ -68,9 +26,9 @@ fn a_preview_arrives_with_sane_geometry() {
 
 #[test]
 fn a_burst_ends_with_the_newest_generation() {
+    let frames = Arc::new(Frames::default());
     let s = TestSession::new();
     import_fixture(&s);
-    let frames = Arc::new(Frames::default());
     let mut last = 0;
     for i in 0..10 {
         exec_ok(
@@ -134,6 +92,7 @@ fn a_null_callback_is_an_invalid_argument() {
 
 #[test]
 fn a_result_for_a_photo_no_longer_active_is_dropped() {
+    let frames = Arc::new(Frames::default());
     let s = TestSession::new();
     let wide = import_png(&s, &gradient_png(s.dir.path(), "wide.png", 3000, 2000));
     let tall = import_png(&s, &gradient_png(s.dir.path(), "tall.png", 64, 96));
@@ -142,7 +101,6 @@ fn a_result_for_a_photo_no_longer_active_is_dropped() {
         "library.select",
         &format!(r#"{{"ids":[{wide}],"active":{wide}}}"#),
     );
-    let frames = Arc::new(Frames::default());
     // The wide render takes far longer than the select below, so it finishes for an inactive photo.
     request(&s, 1024, false, &frames);
     exec_ok(

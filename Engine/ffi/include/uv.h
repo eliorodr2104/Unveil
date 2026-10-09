@@ -35,6 +35,10 @@ const char *uv_last_error(void);
 uint64_t    uv_request_preview(UVSession *session, uint32_t max_pixels, bool draft,
                                uv_frame_cb callback, void *ctx);
 
+/// UV_OK once no render is in flight (at most 2 s, else UV_ERR_TIMEOUT and the session stays
+/// suspended). Previews then fail with UV_ERR_SUSPENDED, and GPU rendering is off for uv_execute too.
 int32_t     uv_suspend(UVSession *session);
+/// Re-enables the GPU and previews, and clears a recorded GPU failure. A lost GPU device is not
+/// recreated in v0: rendering stays on the CPU until the app is relaunched.
 int32_t     uv_resume(UVSession *session);
 void        uv_set_memory_budget(UVSession *session, uint64_t bytes);

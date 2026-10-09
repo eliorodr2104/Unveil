@@ -12,6 +12,7 @@ use lightcraft_engine::Session;
 use lightcraft_engine::pipeline::Rendered;
 use serde_json::Value;
 
+use crate::memory_budget::install_release_hook;
 use crate::panic_guard::{guard, panic_message};
 use crate::preview_scheduler::{PreviewScheduler, Request};
 use crate::render_worker::{RenderDone, RenderWorker, Work};
@@ -19,6 +20,7 @@ use crate::status::{Failure, UVStatus};
 
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_RENDER_WAIT: Duration = Duration::from_secs(10);
+const SUSPEND_TIMEOUT: Duration = Duration::from_secs(2);
 const CAMERA_PROFILES: &str = "LIGHTCRAFT_CAMERA_PROFILES";
 const QOS_CLASS_USER_INITIATED: u32 = 0x19;
 
@@ -95,6 +97,11 @@ pub(crate) enum Msg {
         reply: Sender<Result<Value, Failure>>,
     },
     Preview(PreviewRequest),
+    SetBudget(u64),
+    /// Answered once no render is in flight.
+    Suspend {
+        reply: Sender<()>,
+    },
     // Boxed: a RenderResult is far larger than the other variants.
     RenderDone(Box<RenderDone>),
     Shutdown,
@@ -103,28 +110,33 @@ pub(crate) enum Msg {
 /// UVSession is the opaque handle of uv.h. The engine Session never leaves its thread: callers
 /// only hold the sending side of its channel, and dropping the handle stops and joins the thread.
 /// `has_active` mirrors session.active().is_some() after every command, so uv_request_preview
-/// can refuse at once without waiting behind a long uv_execute.
+/// can refuse at once without waiting behind a long uv_execute. `suspended` is shared with the
+/// engine thread, which drops any preview that reaches it while the flag is set.
 pub struct UVSession {
     tx: Sender<Msg>,
     thread: Option<JoinHandle<()>>,
     generation: AtomicU64,
     has_active: Arc<AtomicBool>,
-    // Set by uv_suspend (T6); a suspended session refuses previews.
-    suspended: AtomicBool,
+    suspended: Arc<AtomicBool>,
 }
 
 impl UVSession {
     /// spawn starts the engine thread and waits until the library at data_dir is open, so a
     /// session that exists is a session that works.
-    fn spawn(data_dir: PathBuf) -> Result<UVSession, Failure> {
+    fn spawn(data_dir: PathBuf, memory_budget: u64) -> Result<UVSession, Failure> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let has_active = Arc::new(AtomicBool::new(false));
-        let (done, active) = (tx.clone(), has_active.clone());
+        let suspended = Arc::new(AtomicBool::new(false));
+        let flags = Flags {
+            has_active: has_active.clone(),
+            suspended: suspended.clone(),
+        };
+        let done = tx.clone();
         let thread = thread::Builder::new()
             .name("unveil-engine".into())
             .stack_size(8 << 20)
-            .spawn(move || engine_main(data_dir, rx, done, active, ready_tx))
+            .spawn(move || engine_main(data_dir, memory_budget, rx, done, flags, ready_tx))
             .map_err(|e| {
                 Failure::new(
                     UVStatus::UV_ERR_ENGINE,
@@ -138,7 +150,7 @@ impl UVSession {
                     thread: Some(thread),
                     generation: AtomicU64::new(0),
                     has_active,
-                    suspended: AtomicBool::new(false),
+                    suspended,
                 });
             }
             Ok(Err(failure)) => failure,
@@ -162,6 +174,22 @@ impl UVSession {
             Err(RecvTimeoutError::Timeout) => Err(Failure::new(
                 UVStatus::UV_ERR_TIMEOUT,
                 format!("`{command}` took longer than 30 s"),
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(stopped()),
+        }
+    }
+
+    /// suspend refuses new previews at once, then waits up to 2 s for the render in flight (the
+    /// pending one is dropped). On UV_OK nothing renders until resume.
+    fn suspend(&self) -> Result<(), Failure> {
+        self.suspended.store(true, Ordering::Release);
+        let (reply, rx) = mpsc::channel();
+        self.tx.send(Msg::Suspend { reply }).map_err(|_| stopped())?;
+        match rx.recv_timeout(SUSPEND_TIMEOUT) {
+            Ok(()) => Ok(()),
+            Err(RecvTimeoutError::Timeout) => Err(Failure::new(
+                UVStatus::UV_ERR_TIMEOUT,
+                "a render is still in flight after 2 s",
             )),
             Err(RecvTimeoutError::Disconnected) => Err(stopped()),
         }
@@ -227,15 +255,22 @@ pub(crate) fn caught<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
         .ok()
 }
 
+/// Flags are the atomics the engine thread shares with UVSession.
+struct Flags {
+    has_active: Arc<AtomicBool>,
+    suspended: Arc<AtomicBool>,
+}
+
 /// engine_main is the body of the engine thread. It reports the library open over `ready`, then
 /// serves messages until Shutdown, and closes the library on exit. `done` is handed to
 /// unveil-render for its RenderDone messages. A panic while handling one command becomes that
 /// command's UV_ERR_PANIC, so the thread lives on.
 fn engine_main(
     data_dir: PathBuf,
+    memory_budget: u64,
     rx: Receiver<Msg>,
     done: Sender<Msg>,
-    has_active: Arc<AtomicBool>,
+    flags: Flags,
     ready: Sender<Result<(), Failure>>,
 ) {
     set_user_initiated_qos();
@@ -254,11 +289,16 @@ fn engine_main(
     }
     // Spec 4.2: no XMP sidecars, whatever the library's prefs.json says.
     session.xmp.auto_write = false;
+    // 0 keeps the engine default.
+    if memory_budget != 0 {
+        session.set_memory_budget(memory_budget as usize);
+    }
     let mut engine = Engine {
         session,
         scheduler: PreviewScheduler::new(),
         worker,
-        has_active,
+        flags,
+        suspend_waiter: None,
     };
     engine.publish_active();
     let _ = ready.send(Ok(()));
@@ -275,11 +315,28 @@ fn engine_main(
                 let _ = reply.send(result);
             }
             Msg::Preview(request) => {
+                // A request that raced uv_suspend: the caller was told "suspended" or will be.
+                if engine.flags.suspended.load(Ordering::Acquire) {
+                    continue;
+                }
                 if let Some(request) = engine.scheduler.submit(request) {
                     engine.start(request);
                 }
             }
-            Msg::RenderDone(done) => engine.finish(*done),
+            Msg::SetBudget(bytes) => {
+                caught("set_memory_budget", || {
+                    engine.session.set_memory_budget(bytes as usize)
+                });
+            }
+            Msg::Suspend { reply } => {
+                engine.scheduler.clear_pending();
+                engine.suspend_waiter = Some(reply);
+                engine.answer_suspend();
+            }
+            Msg::RenderDone(done) => {
+                engine.finish(*done);
+                engine.answer_suspend();
+            }
         }
     }
     engine.shutdown(&rx);
@@ -291,7 +348,8 @@ struct Engine {
     session: Session,
     scheduler: PreviewScheduler<PreviewRequest>,
     worker: RenderWorker,
-    has_active: Arc<AtomicBool>,
+    flags: Flags,
+    suspend_waiter: Option<Sender<()>>,
 }
 
 impl Engine {
@@ -307,9 +365,18 @@ impl Engine {
         })
     }
 
+    /// answer_suspend replies to a waiting uv_suspend once no render is in flight.
+    fn answer_suspend(&mut self) {
+        if self.scheduler.is_idle()
+            && let Some(reply) = self.suspend_waiter.take()
+        {
+            let _ = reply.send(());
+        }
+    }
+
     fn publish_active(&self) {
         let active = self.session.active().is_some();
-        self.has_active.store(active, Ordering::Release);
+        self.flags.has_active.store(active, Ordering::Release);
     }
 
     /// start sends request's job to the worker. When there is nothing to render (the photo is
@@ -411,12 +478,12 @@ unsafe fn c_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, Failure> 
 /// uv_session_new opens the library at data_dir on a new engine thread, or returns NULL with
 /// uv_last_error set. It also points camera profiles at data_dir/camera-profiles, unless
 /// LIGHTCRAFT_CAMERA_PROFILES is already set, so nothing is read from $HOME (spec 4.2).
-/// memory_budget is ignored until the memory ticket (T6) applies it.
+/// A non-zero memory_budget (bytes) is applied before it returns; 0 keeps the engine default.
 ///
 /// # Safety
 /// `data_dir` is NULL or a NUL-terminated UTF-8 path, valid for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn uv_session_new(data_dir: *const c_char, _memory_budget: u64) -> *mut UVSession {
+pub unsafe extern "C" fn uv_session_new(data_dir: *const c_char, memory_budget: u64) -> *mut UVSession {
     guard(|| {
         // SAFETY: the caller's contract above; the path is copied before returning.
         let dir = PathBuf::from(unsafe { c_str(data_dir, "data_dir") }?);
@@ -425,7 +492,8 @@ pub unsafe extern "C" fn uv_session_new(data_dir: *const c_char, _memory_budget:
             // before any other thread reads the environment.
             unsafe { std::env::set_var(CAMERA_PROFILES, dir.join("camera-profiles")) };
         }
-        Ok(Box::into_raw(Box::new(UVSession::spawn(dir)?)))
+        install_release_hook();
+        Ok(Box::into_raw(Box::new(UVSession::spawn(dir, memory_budget)?)))
     })
 }
 
@@ -500,10 +568,6 @@ pub unsafe extern "C" fn uv_string_free(string: *mut c_char) {
     })
 }
 
-fn not_implemented(name: &str) -> Failure {
-    Failure::new(UVStatus::UV_ERR_ENGINE, format!("{name}: not implemented yet"))
-}
-
 /// uv_request_preview asks for a preview of the active photo fitting max_pixels on its long
 /// edge, at draft quality when `draft`, and returns its generation (the first is 1) at once.
 /// The frame reaches `callback` later, on the engine thread, unless a newer request overtakes
@@ -530,31 +594,59 @@ pub unsafe extern "C" fn uv_request_preview(
     })
 }
 
-/// uv_suspend is a stub until the lifecycle ticket (T6): UV_ERR_ENGINE, "not implemented yet".
+/// uv_suspend stops GPU work for the background: new previews fail with UV_ERR_SUSPENDED, the
+/// pending one is dropped, and GPU rendering is switched off, so a uv_execute that renders (an
+/// export) runs on the CPU. It returns UV_OK once the render in flight is done (its frame is
+/// still delivered, before the return). If that takes over 2 s it returns UV_ERR_TIMEOUT, and
+/// the session stays suspended: the late frame is still delivered and uv_resume is still needed.
+/// After UV_OK no frame is delivered until uv_resume; uv_execute keeps working.
 ///
 /// # Safety
 /// `session` is NULL or a live pointer from uv_session_new.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn uv_suspend(_session: *mut UVSession) -> i32 {
-    guard(|| Err(not_implemented("uv_suspend")))
+pub unsafe extern "C" fn uv_suspend(session: *mut UVSession) -> i32 {
+    guard(|| {
+        // SAFETY: a live session per the contract; it is only borrowed for this call.
+        let session = unsafe { session.as_ref() }.ok_or_else(|| Failure::invalid("session is NULL"))?;
+        lightcraft_gpu::set_enabled(false);
+        session.suspend()?;
+        Ok(UVStatus::UV_OK as i32)
+    })
 }
 
-/// uv_resume is a stub until the lifecycle ticket (T6): UV_ERR_ENGINE, "not implemented yet".
+/// uv_resume switches GPU rendering back on, clears a GPU failure recorded earlier and accepts
+/// previews again. It never waits on the engine thread. That recovers errors that leave the GPU
+/// device usable. A lost or never-created device is not recreated in v0: rendering stays on the
+/// CPU until the app is relaunched.
 ///
 /// # Safety
 /// `session` is NULL or a live pointer from uv_session_new.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn uv_resume(_session: *mut UVSession) -> i32 {
-    guard(|| Err(not_implemented("uv_resume")))
+pub unsafe extern "C" fn uv_resume(session: *mut UVSession) -> i32 {
+    guard(|| {
+        // SAFETY: a live session per the contract; it is only borrowed for this call.
+        let session = unsafe { session.as_ref() }.ok_or_else(|| Failure::invalid("session is NULL"))?;
+        lightcraft_gpu::reset_failures();
+        lightcraft_gpu::set_enabled(true);
+        session.suspended.store(false, Ordering::Release);
+        Ok(UVStatus::UV_OK as i32)
+    })
 }
 
-/// uv_set_memory_budget is a no-op stub until the lifecycle ticket (T6).
+/// uv_set_memory_budget sets the process-wide memory budget (at least 64 MiB, the engine clamps
+/// it) at once, then has the engine thread resize this session's caches. It does not wait.
 ///
 /// # Safety
 /// `session` is NULL or a live pointer from uv_session_new.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn uv_set_memory_budget(_session: *mut UVSession, _bytes: u64) {
-    guard(|| Ok(()))
+pub unsafe extern "C" fn uv_set_memory_budget(session: *mut UVSession, bytes: u64) {
+    guard(|| {
+        // SAFETY: a live session per the contract; it is only borrowed for this call.
+        let session = unsafe { session.as_ref() }.ok_or_else(|| Failure::invalid("session is NULL"))?;
+        lightcraft_engine::memory::set_budget(bytes as usize);
+        session.tx.send(Msg::SetBudget(bytes)).map_err(|_| stopped())?;
+        Ok(())
+    })
 }
 
 /// uv_test_panic panics on the calling thread inside the guard, to test that a panic becomes
