@@ -13,12 +13,17 @@ iPad RAW editor (iPadOS 26+): UIKit app shell, SwiftUI panels, and a Rust engine
 ```bash
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"    # before any cargo command
 (cd Engine && cargo test -p unveil-ffi --features test-hooks)
-scripts/build-xcframework.sh                        # created by a later ticket
-scripts/test-app.sh                                 # created by a later ticket
+scripts/build-xcframework.sh [--cpu apple-m1]       # engine XCFramework + Config/UnveilEngine.xcconfig
+scripts/test-app.sh                                 # app unit tests on the first iPad simulator
 ```
+
+Device runs, the golden export and the measurements are in `Docs/Baseline/` (`build-ios.md`,
+`device-run.md`, `equivalence.md`, `measurements.md`).
 
 ## Rules
 
 - `Engine/crates` is upstream code: do not modify it in v0.
 - `lightcraft-engine` is used without features; never call `with_default_face_models` or `with_default_denoise_models`.
 - Commits are made only by the coordinator: workers never stage, commit or push.
+- Branches are `elio/<feature>` (a fix: `elio/<feature>-fix`); a finished feature is merged into `main`
+  with a merge commit and its branch deleted.

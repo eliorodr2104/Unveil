@@ -28,9 +28,17 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
         let engine: EngineManager
+        let options = MeasurementLaunchOptions(arguments: ProcessInfo.processInfo.arguments)
 
         do {
-            engine = try EngineManager(maxPixels: Self.maximumPreviewPixels)
+            if options.isFreshEngineDirectory {
+                engine = try EngineManager(
+                    dataDirectory : Self.freshEngineDirectory(),
+                    maxPixels     : Self.maximumPreviewPixels
+                )
+            } else {
+                engine = try EngineManager(maxPixels: Self.maximumPreviewPixels)
+            }
         } catch {
             engineError = error
             return true
@@ -45,11 +53,20 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
         memoryMonitor.start()
         lifecycleObserver.start()
+        engine.recordState(event: "launch")
 
         self.engine            = engine
         self.memoryMonitor     = memoryMonitor
         self.lifecycleObserver = lifecycleObserver
 
         return true
+    }
+
+    /// freshEngineDirectory is the empty library of `-UnveilEngineDir fresh`, for cold-open
+    /// measurements: `tmp/FreshEngine`, deleted first, so runs never pile up libraries.
+    private static func freshEngineDirectory() -> URL {
+        let directory = URL.temporaryDirectory.appending(path: "FreshEngine", directoryHint: .isDirectory)
+        try? FileManager.default.removeItem(at: directory)
+        return directory
     }
 }

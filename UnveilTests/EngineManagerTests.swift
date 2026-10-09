@@ -44,6 +44,39 @@ struct EngineManagerTests {
     }
 
     @Test
+    func reopeningAfterTheFileMovedRelinksItAndStillRenders() async throws {
+        let manager  = try makeManager(maxPixels: 256)
+        let original = try fixtureURL()
+        let bytes    = try Data(contentsOf: original)
+        let first    = try await manager.openPhoto(at: original)
+
+        // The reinstall case: the first copy is gone and the same bytes live at a new path.
+        try FileManager.default.removeItem(at: original)
+        let moved = FileManager.default.temporaryDirectory.appending(path: "moved-\(UUID()).png")
+        try bytes.write(to: moved)
+
+        let second     = try await manager.openPhoto(at: moved)
+        let generation = try manager.requestPreview(maxPixels: 256, draft: false)
+
+        #expect(second == first)
+        try await waitUntil(seconds: 30) { (manager.frames.latest()?.generation ?? 0) >= generation }
+    }
+
+    /// The everyday reopen: the same path again is a "path" duplicate, opened without a relink.
+    @Test
+    func reopeningTheSamePathSelectsTheSamePhotoAndRenders() async throws {
+        let manager = try makeManager(maxPixels: 256)
+        let file    = try fixtureURL()
+
+        let first      = try await manager.openPhoto(at: file)
+        let second     = try await manager.openPhoto(at: file)
+        let generation = try manager.requestPreview(maxPixels: 256, draft: false)
+
+        #expect(second == first)
+        try await waitUntil(seconds: 30) { (manager.frames.latest()?.generation ?? 0) >= generation }
+    }
+
+    @Test
     func currentValuesReportsWhatWasSet() async throws {
         let manager = try makeManager(maxPixels: 256)
         _ = try await manager.openPhoto(at: fixtureURL())
@@ -76,5 +109,14 @@ struct EngineManagerTests {
             _ = try manager.requestPreview(maxPixels: 256, draft: false)
         }
         try manager.resume()
+    }
+
+    @Test
+    func diagnosticAppGpuReturnsTheBackendState() async throws {
+        let manager = try makeManager(maxPixels: 256)
+
+        let json = try await manager.diagnostic("app.gpu", params: [String: String]())
+
+        #expect(json.contains("\"enabled\""))
     }
 }

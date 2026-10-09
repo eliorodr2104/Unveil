@@ -3,6 +3,7 @@
 // Reference the engine so the staticlib links it and native-static-libs lists its frameworks.
 extern crate lightcraft_engine as _;
 
+pub mod delta_e;
 mod last_error;
 mod memory_budget;
 mod panic_guard;

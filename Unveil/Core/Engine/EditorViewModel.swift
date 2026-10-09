@@ -5,6 +5,7 @@
 
 import Foundation
 import Observation
+import os
 
 /// EditorViewModel is the state of the editor: which photo is open, the ten slider values and the
 /// last error to show. The view reads it, and it drives the engine through `EngineDriving`.
@@ -58,26 +59,49 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
     /// open copies the picked file off the main actor, opens it in the engine, loads the controls'
     /// current values into the sliders and shows a full preview. A photo already in the library
     /// reopens with its saved settings, so the sliders show what the engine holds, not the defaults.
+    ///
+    /// An open that fails, even halfway (the import worked, the select or the values read did not),
+    /// leaves both sides on the previous state: the model keeps its photo and values, and the engine
+    /// is told to select that photo again, which also undoes a select that timed out but still runs,
+    /// because the engine takes commands in order. A copy made for this open is deleted. With no
+    /// previous photo the model stays closed, so nothing acts on whatever the engine has selected.
+    ///
+    /// It is the `OpenToFirstFrame` signpost's start; the interval ends when the canvas presents the
+    /// preview asked for here, or at once as `failed` when no preview was asked for.
     func open(pickedURL: URL) async {
-        let copy: URL
+        let signpost = Signposts.beginOpen()
+        let copy: (url: URL, isNew: Bool)
 
         do {
             copy = try await Self.importCopy(of: pickedURL, using: importer)
         } catch {
+            Signposts.openRequestedPreview(signpost, generation: nil)
             errorMessage = Self.message(for: error)
             return
         }
 
         await enqueue { [engine, previewPixels] in
-            let photo = try await engine.openPhoto(at: copy)
+            var previewGeneration: UInt64?
+            defer { Signposts.openRequestedPreview(signpost, generation: previewGeneration) }
+
+            let previous = self.openPhoto
+            let photo    : PhotoID
+            let current  : [DevelopAdjustmentKind: Double]
+
+            do {
+                photo   = try await engine.openPhoto(at: copy.url)
+                current = try await engine.currentValues()
+            } catch {
+                await Self.rollBack(engine: engine, to: previous, discarding: copy)
+                throw error
+            }
+
             self.openPhoto = photo
+            self.values    = Self.defaultValues.merging(current) { _, engineValue in engineValue }
+            self.sent      = self.values
+            self.wanted    = [:]
 
-            let current = try await engine.currentValues()
-            self.values = Self.defaultValues.merging(current) { _, engineValue in engineValue }
-            self.sent   = self.values
-            self.wanted = [:]
-
-            _ = try engine.requestPreview(maxPixels: previewPixels, draft: false)
+            previewGeneration = try engine.requestPreview(maxPixels: previewPixels, draft: false)
         }
     }
 
@@ -162,14 +186,50 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
 
     // MARK: - Helpers
 
+    /// rollBack puts the engine back on `previous` and deletes `copy` if this open made it. Its own
+    /// failures are only logged: the open's error is the one the user sees.
+    private static func rollBack(
+        engine          : Engine,
+        to previous     : PhotoID?,
+        discarding copy : (url: URL, isNew: Bool)
+    ) async {
+        let logger = Logger(subsystem: "com.eliorodr2104.unveil", category: "EditorViewModel")
+
+        if let previous {
+            do {
+                try await engine.select(previous)
+            } catch {
+                logger.error("Re-selecting the previous photo failed: \(error.message, privacy: .public)")
+            }
+        }
+
+        if copy.isNew {
+            do {
+                try FileManager.default.removeItem(at: copy.url)
+            } catch {
+                logger.error("Deleting a failed import failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
     private static var defaultValues: [DevelopAdjustmentKind: Double] {
         Dictionary(uniqueKeysWithValues: DevelopAdjustmentKind.allCases.map { ($0, $0.defaultValue) })
     }
 
     /// importCopy runs the importer off the main actor: copying a 50 to 100 MB RAW would stall the UI.
+    /// The copy is the `ImportCopy` signpost.
     @concurrent
-    private static func importCopy(of pickedURL: URL, using importer: Importer) async throws(PhotoImportError) -> URL {
-        try importer.importCopy(of: pickedURL)
+    private static func importCopy(
+        of pickedURL   : URL,
+        using importer : Importer
+    ) async throws(PhotoImportError) -> (url: URL, isNew: Bool) {
+        let signpost = Signposts.signposter.beginInterval(
+            "ImportCopy",
+            id: Signposts.signposter.makeSignpostID()
+        )
+        defer { Signposts.signposter.endInterval("ImportCopy", signpost) }
+
+        return try importer.importCopy(of: pickedURL)
     }
 
     private static func message(for error: PhotoImportError) -> String {

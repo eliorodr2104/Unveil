@@ -5,6 +5,7 @@
 
 import Foundation
 import Metal
+import os
 import UnveilEngine
 
 /// EngineManager is the only door to the engine: no other type calls `uv_*`. It owns the session
@@ -26,7 +27,7 @@ import UnveilEngine
 /// Sendable. It is never mutated after init, and every `uv_*` function is documented as callable
 /// from any thread; the engine serialises the work on its own thread behind that handle.
 // Nonisolated: the queue and the engine thread call into it, and the app default is MainActor.
-nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
+nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @unchecked Sendable {
 
     let frames: FrameSink
 
@@ -59,9 +60,12 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
         let duplicates: [Duplicate]
         let failed    : [[String]]
 
+        /// Duplicate names the photo that already has the file. `reason` is "path" when that photo
+        /// was imported from this very path, "content" when the same bytes live elsewhere.
         struct Duplicate: Decodable {
 
             let existing: UInt64?
+            let reason  : String
         }
     }
 
@@ -69,6 +73,12 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
 
         let ids   : [UInt64]
         let active: UInt64
+    }
+
+    private struct RelinkRequest: Encodable {
+
+        let id  : UInt64
+        let path: String
     }
 
     private struct DevelopSetRequest: Encodable {
@@ -98,8 +108,15 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
         guard maxPixels > 0 else { throw .invalidArgument("maxPixels must be positive, got \(maxPixels)") }
         guard let device = MTLCreateSystemDefaultDevice() else { throw .engine("no Metal device") }
 
+        // Out of the iCloud backup, like the Imports copies its records point at: the edits it holds
+        // are therefore not backed up either (a v0 trade-off, by ruling).
         do {
-            try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+            var directory = dataDirectory
+            var noBackup  = URLResourceValues()
+            noBackup.isExcludedFromBackup = true
+
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try directory.setResourceValues(noBackup)
         } catch {
             throw .io("cannot create \(dataDirectory.path(percentEncoded: false)): \(error.localizedDescription)")
         }
@@ -131,6 +148,11 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
     ///
     /// The id comes from `imported`, else `restored` (it was in the trash), else `duplicates` (the
     /// path or the bytes are already in the library), so reopening a photo works like a first open.
+    /// An existing record is relinked to `fileURL` before it is selected: iOS gives the app a new
+    /// data container when it is reinstalled, so the path the library stored may no longer exist,
+    /// and a render of it would never deliver a frame. The copy just imported is the live file.
+    /// A "path" duplicate is not relinked: the record already points at `fileURL`, and a relink
+    /// would only re-hash the whole file (about 286 ms on a 46 MP NEF).
     /// A file the engine cannot read still returns UV_OK, with the reason in `failed`: that is
     /// how an unreadable file becomes an error here.
     func openPhoto(at fileURL: URL) async throws(EngineError) -> PhotoID {
@@ -138,7 +160,9 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
             let request = ImportRequest(paths: [fileURL.path(percentEncoded: false)])
             let report  = try self.decode(ImportReport.self, from: self.execute("library.import", request))
 
-            guard let id = report.imported.first ?? report.restored?.first ?? report.duplicates.first?.existing
+            let existing = report.restored?.first ?? report.duplicates.first?.existing
+
+            guard let id = report.imported.first ?? existing
             else {
                 if let failure = report.failed.first {
                     throw .engine(failure.dropFirst().first ?? "the engine could not import the file")
@@ -146,8 +170,21 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
                 throw .engine("nothing imported")
             }
 
+            if report.imported.isEmpty, report.duplicates.first?.reason != "path" {
+                let relink = RelinkRequest(id: id, path: fileURL.path(percentEncoded: false))
+                _ = try self.execute("photo.relink", relink)
+            }
+
             _ = try self.execute("library.select", SelectRequest(ids: [id], active: id))
             return PhotoID(rawValue: id)
+        }
+    }
+
+    /// select makes `photo` the active photo. The editor uses it to put the engine back on the
+    /// photo it still shows when an open fails halfway.
+    func select(_ photo: PhotoID) async throws(EngineError) {
+        try await onQueue { () throws(EngineError) in
+            _ = try self.execute("library.select", SelectRequest(ids: [photo.rawValue], active: photo.rawValue))
         }
     }
 
@@ -209,7 +246,10 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
             Unmanaged.passUnretained(frames).toOpaque()
         )
 
-        guard generation == 0 else { return generation }
+        guard generation == 0 else {
+            Signposts.previewRequested(generation: generation, isDraft: draft)
+            return generation
+        }
 
         // ponytail: uv_request_preview has no status code, so "suspended" is told apart by its
         // documented message; a status out-parameter in uv.h would replace the string match.
@@ -217,9 +257,44 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
         throw message == "the session is suspended" ? .suspended(message) : .engine(message)
     }
 
+    /// diagnostic runs one engine command and returns its JSON result untouched. It is the single
+    /// door for the diagnostics (`app.gpu`, `develop.reset`, `library.memory`), on the command queue
+    /// like every other command. Never send `app.gpu` anything but `{}`: it would change the preference.
+    func diagnostic(_ command: String, params: some Encodable & Sendable) async throws(EngineError) -> String {
+        try await onQueue { () throws(EngineError) -> String in
+            let result = try self.execute(command, params)
+            return String(decoding: result, as: UTF8.self)
+        }
+    }
+
+    /// recordState queues a read of `app.gpu` on the command queue and appends it to `engine.jsonl`.
+    /// It returns at once, so main never waits on it, and the read lands behind any command in flight.
+    func recordState(event: String) {
+        queue.async {
+            let gpu: String
+
+            do throws(EngineError) {
+                gpu = String(decoding: try self.execute("app.gpu", [String: String]()), as: UTF8.self)
+            } catch {
+                gpu = EngineStateLog.errorJSON(error.message)
+            }
+
+            EngineStateLog.append(
+                event         : event,
+                gpu           : gpu,
+                possibleTears : nil
+            )
+        }
+    }
+
     /// suspend stops GPU work for the background and blocks until the render in flight is done,
     /// at most 2 s. On `.timeout` the session is suspended anyway, so `resume()` is still needed.
+    ///
+    /// Whatever the outcome, it records the engine state afterwards: `resume()` clears the engine's
+    /// last GPU fallback, so a fallback during the background is only visible between the two.
     func suspend() throws(EngineError) {
+        defer { recordState(event: "suspend") }
+
         try Self.check(uv_suspend(session))
     }
 
@@ -246,7 +321,15 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
     }
 
     /// execute runs one engine command and returns its JSON result. Called on the command queue only.
+    /// Each call is a `Command` signpost named after the command, so a trace shows where `open` goes.
     private func execute(_ command: String, _ params: some Encodable) throws(EngineError) -> Data {
+        let signpost = Signposts.signposter.beginInterval(
+            "Command",
+            id: Signposts.signposter.makeSignpostID(),
+            "\(command, privacy: .public)"
+        )
+        defer { Signposts.signposter.endInterval("Command", signpost) }
+
         let json: Data
         do {
             json = try JSONEncoder().encode(params)

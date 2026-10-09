@@ -280,6 +280,14 @@ final class CanvasView: UIView {
 
         encoder.endEncoding()
 
+        // Added before present, as Metal requires: the handler ends the frame's signposts.
+        // The simulator's Metal has no presented handler, so its frame intervals never end.
+        #if !targetEnvironment(simulator)
+        if let sampledFrame {
+            drawable.addPresentedHandler(Self.presentedHandler(generation: sampledFrame.generation))
+        }
+        #endif
+
         commandBuffer.present(drawable)
         commandBuffer.addCompletedHandler { [crossThread, frames, sampledFrame] _ in
             crossThread.commandBufferCompleted(sampled: sampledFrame, newest: frames.latest())
@@ -288,6 +296,20 @@ final class CanvasView: UIView {
 
         return true
     }
+
+    #if !targetEnvironment(simulator)
+    /// presentedHandler ends the signposts waiting for `generation` once the drawable has left the
+    /// display pipeline. It is built here, nonisolated, because Metal calls it on its own thread.
+    ///
+    /// A presented time of 0 is reported as `dropped`, not skipped: on the iPad the first frame of
+    /// an open with an otherwise idle canvas reports 0, and skipping it left the open's interval
+    /// waiting for a frame that never comes (seen in a device trace, M3.4).
+    private nonisolated static func presentedHandler(generation: UInt64) -> @Sendable (any MTLDrawable) -> Void {
+        { drawable in
+            Signposts.framePresented(generation: generation, isDropped: drawable.presentedTime == 0)
+        }
+    }
+    #endif
 
     /// texture(for:) returns the cached texture over the buffer holding `frame`, making a new one
     /// only when that buffer's frame changed size or stride.

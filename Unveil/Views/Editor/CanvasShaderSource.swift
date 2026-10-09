@@ -4,6 +4,7 @@
 //
 
 import Metal
+import os
 
 /// CanvasShaderSource holds the canvas shaders as Metal source text and builds their pipeline.
 ///
@@ -59,10 +60,17 @@ nonisolated enum CanvasShaderSource {
     /// makePipelineState(device:pixelFormat:) compiles `text` on `device` and returns the render
     /// pipeline that draws into a drawable of `pixelFormat`. It throws the compiler's own error when
     /// the source does not compile, and CanvasShaderError when a named function is missing.
+    /// The whole build is the `ShaderCompile` signpost: it runs on main when the canvas is made.
     static func makePipelineState(
         device     : some MTLDevice,
         pixelFormat: MTLPixelFormat
     ) throws -> any MTLRenderPipelineState {
+        let signpost = Signposts.signposter.beginInterval(
+            "ShaderCompile",
+            id: Signposts.signposter.makeSignpostID()
+        )
+        defer { Signposts.signposter.endInterval("ShaderCompile", signpost) }
+
         let library = try device.makeLibrary(source: text, options: nil)
 
         guard let vertexFunction = library.makeFunction(name: vertexFunctionName) else {
