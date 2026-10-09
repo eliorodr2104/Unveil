@@ -96,6 +96,11 @@ extern "C" fn keep_pixels(
 
 /// preview_with_exposure sets the exposure and returns the full-quality 2048 px preview's RGBA bytes.
 fn preview_with_exposure(s: &TestSession, pixels: &Arc<Pixels>, exposure: f64) -> Vec<u8> {
+    preview(s, pixels, exposure, false)
+}
+
+/// preview sets the exposure and returns the 2048 px preview's RGBA bytes, draft or full quality.
+fn preview(s: &TestSession, pixels: &Arc<Pixels>, exposure: f64, draft: bool) -> Vec<u8> {
     exec_ok(
         s,
         "develop.set",
@@ -103,7 +108,7 @@ fn preview_with_exposure(s: &TestSession, pixels: &Arc<Pixels>, exposure: f64) -
     );
     let ctx = Arc::as_ptr(pixels) as *mut _;
     // SAFETY: s.raw is live; pixels is declared before s, so it outlives the session.
-    let g = unsafe { uv_request_preview(s.raw, 2048, false, Some(keep_pixels), ctx) };
+    let g = unsafe { uv_request_preview(s.raw, 2048, draft, Some(keep_pixels), ctx) };
     assert!(g > 0, "{}", last_error());
     let guard = pixels.frame.lock().unwrap();
     let (guard, _) = pixels
@@ -187,4 +192,33 @@ fn suspend_releases_every_gpu_buffer() {
     assert_eq!(unsafe { uv_suspend(s.raw) }, 0, "{}", last_error());
     let after = lightcraft_gpu::memory();
     assert_eq!(after.allocated, 0, "GPU buffers survived uv_suspend: {after:?}");
+}
+
+#[test]
+fn repeated_draft_previews_keep_gpu_memory_flat() {
+    let _turn = serial();
+    let pixels = Arc::new(Pixels::default());
+    let s = TestSession::new();
+    // SAFETY: s.raw is live.
+    assert_eq!(unsafe { uv_resume(s.raw) }, 0);
+    if !lightcraft_gpu::available() {
+        eprintln!("skipped: no GPU adapter");
+        return;
+    }
+    import_png(&s, &gradient_png(s.dir.path(), "flat.png", 640, 427));
+    // Each frame uploads a 32 KiB LUT block; before the fix every one of them stayed in the
+    // pool, so pooled bytes grew by one block per frame up to the pool limit.
+    for i in 0..20 {
+        preview(&s, &pixels, i as f64 * 0.01, true);
+    }
+    let plateau = lightcraft_gpu::memory();
+    for i in 20..2000 {
+        preview(&s, &pixels, i as f64 * 0.001, true);
+    }
+    let end = lightcraft_gpu::memory();
+    eprintln!("plateau {plateau:?}, after 2000 drafts {end:?}");
+    assert!(
+        end.allocated <= plateau.allocated + (1 << 20),
+        "GPU memory grew with the frame count: {plateau:?} -> {end:?}"
+    );
 }

@@ -9,5 +9,5 @@ Not copied: .gitignore, apps/, xtask/, docs/ (including the ArtCraft trademarks 
 Local changes in v0: Engine/Cargo.toml `members` (now `["crates/*", "ffi"]`), and Engine/Cargo.lock:
 pruned by Cargo at import (packages of the excluded crates removed, no version changed), then extended
 with the packages of the `ffi` bridge (`unveil-ffi` and its own dependencies, such as `dhat` for the
-leak test). No file under crates/ is modified in v0. The first change to one starts a CHANGES.md next
-to this file that lists every such change, as Apache-2.0 section 4(b) requires.
+leak test). Changes to files under crates/ are listed in CHANGES.md next to this file, as Apache-2.0
+section 4(b) requires; each changed file also carries a notice at its top.

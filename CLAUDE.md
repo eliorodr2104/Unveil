@@ -22,7 +22,9 @@ Device runs, the golden export and the measurements are in `Docs/Baseline/` (`bu
 
 ## Rules
 
-- `Engine/crates` is upstream code: do not modify it in v0.
+- `Engine/crates` is upstream code: change it only with an Apache-2.0 §4(b) notice in the file and an entry in
+  `Engine/CHANGES.md`, keep upstream rustfmt for those files (`max_width = 150`, edition 2024), and benchmark
+  every change against the `baseline-v0` tag.
 - `lightcraft-engine` is used without features; never call `with_default_face_models` or `with_default_denoise_models`.
 - Commits are made only by the coordinator: workers never stage, commit or push.
 - Branches are `elio/<feature>` (a fix: `elio/<feature>-fix`); a finished feature is merged into `main`
