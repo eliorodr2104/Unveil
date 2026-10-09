@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::memory_budget::install_release_hook;
 use crate::panic_guard::{guard, panic_message};
 use crate::preview_scheduler::{PreviewScheduler, Request};
+use crate::preview_stages::PreviewStages;
 use crate::render_worker::{RenderDone, RenderWorker, Work};
 use crate::status::{Failure, UVStatus};
 
@@ -296,6 +297,7 @@ fn engine_main(
     let mut engine = Engine {
         session,
         scheduler: PreviewScheduler::new(),
+        stages: PreviewStages::default(),
         worker,
         flags,
         suspend_waiter: None,
@@ -312,6 +314,7 @@ fn engine_main(
             } => {
                 let result = engine.execute(&command, &params);
                 engine.publish_active();
+                engine.stages.keep_only(engine.session.active());
                 let _ = reply.send(result);
             }
             Msg::Preview(request) => {
@@ -324,12 +327,17 @@ fn engine_main(
                 }
             }
             Msg::SetBudget(bytes) => {
-                caught("set_memory_budget", || {
+                if let Some(budget) = caught("set_memory_budget", || {
                     engine.session.set_memory_budget(bytes as usize)
-                });
+                }) {
+                    engine.stages.trim(budget);
+                }
             }
             Msg::Suspend { reply } => {
                 engine.scheduler.clear_pending();
+                // Drop the stages (171 MB NEF, 153 MB RAF at 2360 px, measured on the Mac at the iPad budget)
+                // into the GPU pool, emptied by uv_suspend; a render in flight keeps its copy until it ends.
+                engine.stages = PreviewStages::default();
                 engine.suspend_waiter = Some(reply);
                 engine.answer_suspend();
             }
@@ -342,11 +350,12 @@ fn engine_main(
     engine.shutdown(&rx);
 }
 
-/// Engine is the state of the engine thread: the Session, the preview scheduler and the render
-/// worker it feeds.
+/// Engine is the state of the engine thread: the Session, the preview scheduler, the preview
+/// view's resident stages and the render worker it feeds.
 struct Engine {
     session: Session,
     scheduler: PreviewScheduler<PreviewRequest>,
+    stages: PreviewStages,
     worker: RenderWorker,
     flags: Flags,
     suspend_waiter: Option<Sender<()>>,
@@ -410,7 +419,7 @@ impl Engine {
             job = job.draft();
         }
         job.request_id = request.generation;
-        Some(job)
+        Some(self.stages.attach(job))
     }
 
     /// finish caches what the render decoded, delivers the frame if it is still the newest for
@@ -599,7 +608,9 @@ pub unsafe extern "C" fn uv_request_preview(
 /// export) runs on the CPU. It returns UV_OK once the render in flight is done (its frame is
 /// still delivered, before the return). If that takes over 2 s it returns UV_ERR_TIMEOUT, and
 /// the session stays suspended: the late frame is still delivered and uv_resume is still needed.
-/// After UV_OK no frame is delivered until uv_resume; uv_execute keeps working.
+/// After UV_OK no frame is delivered until uv_resume; uv_execute keeps working. The preview's
+/// resident stages are released too, and on UV_OK the GPU buffer pool they return to is emptied,
+/// so the background holds no device buffers; the first preview after uv_resume rebuilds them.
 ///
 /// # Safety
 /// `session` is NULL or a live pointer from uv_session_new.
@@ -610,6 +621,9 @@ pub unsafe extern "C" fn uv_suspend(session: *mut UVSession) -> i32 {
         let session = unsafe { session.as_ref() }.ok_or_else(|| Failure::invalid("session is NULL"))?;
         lightcraft_gpu::set_enabled(false);
         session.suspend()?;
+        // On UV_OK no render runs and the stages' last owner has dropped them into the GPU pool (kept up
+        // to budget / 8): empty it. trim_pool may run on any thread outside a render, as this one is.
+        lightcraft_gpu::trim_pool(0);
         Ok(UVStatus::UV_OK as i32)
     })
 }
