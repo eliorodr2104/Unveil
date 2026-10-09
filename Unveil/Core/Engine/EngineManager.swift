@@ -71,6 +71,12 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
         let active: UInt64
     }
 
+    private struct RelinkRequest: Encodable {
+
+        let id  : UInt64
+        let path: String
+    }
+
     private struct DevelopSetRequest: Encodable {
 
         let control: String
@@ -131,6 +137,9 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
     ///
     /// The id comes from `imported`, else `restored` (it was in the trash), else `duplicates` (the
     /// path or the bytes are already in the library), so reopening a photo works like a first open.
+    /// An existing record is relinked to `fileURL` before it is selected: iOS gives the app a new
+    /// data container when it is reinstalled, so the path the library stored may no longer exist,
+    /// and a render of it would never deliver a frame. The copy just imported is the live file.
     /// A file the engine cannot read still returns UV_OK, with the reason in `failed`: that is
     /// how an unreadable file becomes an error here.
     func openPhoto(at fileURL: URL) async throws(EngineError) -> PhotoID {
@@ -138,12 +147,19 @@ nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @uncheck
             let request = ImportRequest(paths: [fileURL.path(percentEncoded: false)])
             let report  = try self.decode(ImportReport.self, from: self.execute("library.import", request))
 
-            guard let id = report.imported.first ?? report.restored?.first ?? report.duplicates.first?.existing
+            let existing = report.restored?.first ?? report.duplicates.first?.existing
+
+            guard let id = report.imported.first ?? existing
             else {
                 if let failure = report.failed.first {
                     throw .engine(failure.dropFirst().first ?? "the engine could not import the file")
                 }
                 throw .engine("nothing imported")
+            }
+
+            if report.imported.isEmpty {
+                let relink = RelinkRequest(id: id, path: fileURL.path(percentEncoded: false))
+                _ = try self.execute("photo.relink", relink)
             }
 
             _ = try self.execute("library.select", SelectRequest(ids: [id], active: id))

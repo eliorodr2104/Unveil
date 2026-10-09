@@ -59,7 +59,8 @@ nonisolated struct GoldenExporter<Engine: EngineDriving & EngineDiagnosing>: Sen
 
     private static var rawExtensions: Set<String> { ["raf", "nef", "arw", "cr3", "dng"] }
     private static var previewPixels: Int          { 2048 }
-    private static var renderTimeout: Duration     { .seconds(120) }
+    // One render takes 0.2 to 0.5 s on the iPad; a source the engine cannot load never answers.
+    private static var renderTimeout: Duration     { .seconds(15) }
 
     private let engine         : Engine
     private let rawDirectory   : URL
