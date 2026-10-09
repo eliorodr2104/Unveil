@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: Gpu::upload reuses pooled buffers; see Engine/CHANGES.md.
 //! The wgpu device, the compiled kernels, buffers, dispatch and readback.
 
 use std::collections::HashMap;
@@ -199,6 +200,9 @@ static RETIRED_BYTES: AtomicU64 = AtomicU64::new(0);
 static POOLED: AtomicU64 = AtomicU64::new(0);
 /// Most bytes kept in the free pool (see [`crate::set_pool_limit`]).
 pub(crate) static POOL_LIMIT: AtomicU64 = AtomicU64::new(DEFAULT_POOL_BYTES);
+
+/// Uploads smaller than this (bytes) reuse pooled buffers (see [`Gpu::upload`]).
+const SMALL_UPLOAD: usize = 1 << 20;
 
 /// Default for the most bytes kept in the free pool (apps derive it from their memory budget).
 pub(crate) const DEFAULT_POOL_BYTES: u64 = 256 << 20;
@@ -440,6 +444,10 @@ impl Gpu {
     }
 
     /// Upload 32-bit values.
+    ///
+    /// Small uploads (under [`SMALL_UPLOAD`]) go into a recycled buffer when one fits: a fresh one
+    /// per call would join the free pool on drop and, never asked for again, pile up to its limit.
+    /// The write lands before the next submit, after every earlier use of the recycled buffer.
     pub fn upload<T: bytemuck::Pod>(&self, data: &[T]) -> Buf {
         let bytes: &[u8] = bytemuck::cast_slice(data);
         let len = bytes.len() / 4;
@@ -449,6 +457,12 @@ impl Gpu {
         if bytes.len() as u64 > self.limit() {
             self.over_limit(bytes.len() as u64);
             return Buf { buf: Some(Tracked::new(self.placeholder())), len };
+        }
+        // large uploads (the source) keep a fresh buffer: writing a recycled one needs a staging copy as big
+        if bytes.len() < SMALL_UPLOAD && bytes.len().is_multiple_of(4) {
+            let buf = self.buffer(len);
+            self.queue.write_buffer(buf.raw(), 0, bytes);
+            return buf;
         }
         let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,

@@ -8,6 +8,7 @@ mod last_error;
 mod memory_budget;
 mod panic_guard;
 mod preview_scheduler;
+mod preview_stages;
 mod render_worker;
 mod session;
 mod status;
