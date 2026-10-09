@@ -77,6 +77,14 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
         let value  : Double
     }
 
+    /// ControlReading is one row of `develop.controls`: the control id and its current value, which
+    /// is null for nothing the engine can read. The rest of the row (range, label) is ignored.
+    private struct ControlReading: Decodable {
+
+        let id   : String
+        let value: Double?
+    }
+
     /// init(dataDirectory:maxPixels:) opens the engine's library in `dataDirectory`, creating the
     /// folder first (Application Support does not exist on a fresh install), and allocates a FrameSink
     /// whose long edge is `maxPixels`. It blocks until the engine thread has the library open, so the
@@ -150,6 +158,25 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
 
         try await onQueue { () throws(EngineError) in
             _ = try self.execute("develop.set", DevelopSetRequest(control: adjustment.rawValue, value: value))
+        }
+    }
+
+    /// currentValues reads the active photo's controls with `develop.controls` and keeps the ten
+    /// the editor shows. The command lists every control with its id, which is also our raw value,
+    /// so no mapping table is needed.
+    func currentValues() async throws(EngineError) -> [DevelopAdjustmentKind: Double] {
+        try await onQueue { () throws(EngineError) -> [DevelopAdjustmentKind: Double] in
+            let result   = try self.execute("develop.controls", [String: String]())
+            let readings = try self.decode([ControlReading].self, from: result)
+            var values   = [DevelopAdjustmentKind: Double]()
+
+            for reading in readings {
+                if let kind = DevelopAdjustmentKind(rawValue: reading.id), let value = reading.value {
+                    values[kind] = value
+                }
+            }
+
+            return values
         }
     }
 

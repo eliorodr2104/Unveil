@@ -44,6 +44,18 @@ struct EngineManagerTests {
     }
 
     @Test
+    func currentValuesReportsWhatWasSet() async throws {
+        let manager = try makeManager(maxPixels: 256)
+        _ = try await manager.openPhoto(at: fixtureURL())
+        try await manager.set(.exposure, to: 0.5)
+
+        let values = try await manager.currentValues()
+
+        #expect(values[.exposure] == 0.5)
+        #expect(values.count == DevelopAdjustmentKind.allCases.count)
+    }
+
+    @Test
     func anUnknownFileIsAnErrorNotACrash() async throws {
         let manager = try makeManager(maxPixels: 256)
         let url     = FileManager.default.temporaryDirectory.appending(path: "broken-\(UUID()).ARW")
