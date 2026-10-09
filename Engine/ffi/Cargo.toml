@@ -21,6 +21,7 @@ log = { workspace = true }
 
 [dev-dependencies]
 png = { workspace = true }
+dhat = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
