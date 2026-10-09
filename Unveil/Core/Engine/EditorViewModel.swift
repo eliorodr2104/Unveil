@@ -120,6 +120,17 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
         }
     }
 
+    /// refreshPreview asks for one full preview of the open photo, behind any queued work. The app
+    /// calls it when the engine resumes: a render refused while suspended would otherwise leave the
+    /// canvas on a draft frame until the next slider move.
+    func refreshPreview() async {
+        guard isPhotoOpen else { return }
+
+        await enqueue { [engine, previewPixels] in
+            _ = try engine.requestPreview(maxPixels: previewPixels, draft: false)
+        }
+    }
+
     func dismissError() {
         errorMessage = nil
     }
@@ -136,8 +147,10 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
 
             do {
                 try await step()
+            } catch EngineError.suspended {
+                // Expected when the app resigns active mid-drag: refreshPreview redraws on resume.
             } catch let error as EngineError {
-                errorMessage = Self.message(for: error)
+                errorMessage = error.message
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -157,15 +170,6 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
     @concurrent
     private static func importCopy(of pickedURL: URL, using importer: Importer) async throws(PhotoImportError) -> URL {
         try importer.importCopy(of: pickedURL)
-    }
-
-    /// message turns an engine error into the sentence the alert shows: the engine's own text.
-    private static func message(for error: EngineError) -> String {
-        switch error {
-            case .invalidArgument(let text), .unknownCommand(let text), .engine(let text), .panic(let text),
-                 .suspended(let text), .io(let text), .timeout(let text), .unknown(_, let text):
-                return text
-        }
     }
 
     private static func message(for error: PhotoImportError) -> String {

@@ -33,4 +33,14 @@ nonisolated enum EngineError: Error, Equatable {
             default:                               self = .unknown(code: status, message: message)
         }
     }
+
+    /// message is the engine's own text, without the case: what an alert or a log line shows.
+    var message: String {
+        switch self {
+            case .invalidArgument(let text), .unknownCommand(let text), .engine(let text),
+                 .panic(let text), .suspended(let text), .io(let text), .timeout(let text),
+                 .unknown(_, let text):
+                return text
+        }
+    }
 }
