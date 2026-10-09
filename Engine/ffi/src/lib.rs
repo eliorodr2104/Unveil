@@ -5,6 +5,8 @@ extern crate lightcraft_engine as _;
 
 mod last_error;
 mod panic_guard;
+mod preview_scheduler;
+mod render_worker;
 mod session;
 mod status;
 

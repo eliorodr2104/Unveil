@@ -2,17 +2,23 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lightcraft_engine::Session;
+use lightcraft_engine::pipeline::Rendered;
 use serde_json::Value;
 
 use crate::panic_guard::{guard, panic_message};
+use crate::preview_scheduler::{PreviewScheduler, Request};
+use crate::render_worker::{RenderDone, RenderWorker, Work};
 use crate::status::{Failure, UVStatus};
 
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_RENDER_WAIT: Duration = Duration::from_secs(10);
 const CAMERA_PROFILES: &str = "LIGHTCRAFT_CAMERA_PROFILES";
 const QOS_CLASS_USER_INITIATED: u32 = 0x19;
 
@@ -31,21 +37,80 @@ pub type UvFrameCb = unsafe extern "C" fn(
     draft: bool,
 );
 
-/// Msg is what the engine thread receives. Each request carries its own reply channel.
+/// FrameCallback is a uv_frame_cb with its ctx, carried from uv_request_preview to the engine
+/// thread, which is the only thread that ever calls it.
+#[derive(Clone, Copy)]
+pub(crate) struct FrameCallback {
+    f: UvFrameCb,
+    ctx: *mut c_void,
+}
+
+// SAFETY: uv_request_preview's caller guarantees ctx stays valid and usable from another
+// thread for as long as the session lives; f is a plain function pointer.
+unsafe impl Send for FrameCallback {}
+
+impl FrameCallback {
+    /// call hands the frame's pixels to the callback without a copy: RGBA8, rows of width * 4.
+    fn call(&self, rendered: &Rendered, generation: u64, draft: bool) {
+        let image = &rendered.image;
+        let rgba = image.data.as_flattened();
+        let (width, height) = (image.width as u32, image.height as u32);
+        // SAFETY: rgba is owned by the RenderResult and outlives the call, which is all uv_frame_cb
+        // promises; ctx is valid per uv_request_preview's contract.
+        unsafe {
+            (self.f)(
+                self.ctx,
+                rgba.as_ptr(),
+                width,
+                height,
+                width * 4,
+                generation,
+                draft,
+            )
+        };
+    }
+}
+
+/// PreviewRequest is one uv_request_preview. Its job is built only when it starts, so a request
+/// that waited behind a render picks up the settings of the moment.
+pub(crate) struct PreviewRequest {
+    generation: u64,
+    max_pixels: u32,
+    draft: bool,
+    callback: FrameCallback,
+}
+
+impl Request for PreviewRequest {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Msg is what the engine thread receives. Each request carries its own reply channel;
+/// RenderDone comes from unveil-render.
 pub(crate) enum Msg {
     Execute {
         command: String,
         params: Value,
         reply: Sender<Result<Value, Failure>>,
     },
+    Preview(PreviewRequest),
+    // Boxed: a RenderResult is far larger than the other variants.
+    RenderDone(Box<RenderDone>),
     Shutdown,
 }
 
 /// UVSession is the opaque handle of uv.h. The engine Session never leaves its thread: callers
 /// only hold the sending side of its channel, and dropping the handle stops and joins the thread.
+/// `has_active` mirrors session.active().is_some() after every command, so uv_request_preview
+/// can refuse at once without waiting behind a long uv_execute.
 pub struct UVSession {
     tx: Sender<Msg>,
     thread: Option<JoinHandle<()>>,
+    generation: AtomicU64,
+    has_active: Arc<AtomicBool>,
+    // Set by uv_suspend (T6); a suspended session refuses previews.
+    suspended: AtomicBool,
 }
 
 impl UVSession {
@@ -54,10 +119,12 @@ impl UVSession {
     fn spawn(data_dir: PathBuf) -> Result<UVSession, Failure> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let has_active = Arc::new(AtomicBool::new(false));
+        let (done, active) = (tx.clone(), has_active.clone());
         let thread = thread::Builder::new()
             .name("unveil-engine".into())
             .stack_size(8 << 20)
-            .spawn(move || engine_main(data_dir, rx, ready_tx))
+            .spawn(move || engine_main(data_dir, rx, done, active, ready_tx))
             .map_err(|e| {
                 Failure::new(
                     UVStatus::UV_ERR_ENGINE,
@@ -69,6 +136,9 @@ impl UVSession {
                 return Ok(UVSession {
                     tx,
                     thread: Some(thread),
+                    generation: AtomicU64::new(0),
+                    has_active,
+                    suspended: AtomicBool::new(false),
                 });
             }
             Ok(Err(failure)) => failure,
@@ -96,6 +166,38 @@ impl UVSession {
             Err(RecvTimeoutError::Disconnected) => Err(stopped()),
         }
     }
+
+    /// request_preview checks only atomics, then queues the request: it never waits on the engine.
+    fn request_preview(
+        &self,
+        max_pixels: u32,
+        draft: bool,
+        callback: Option<UvFrameCb>,
+        ctx: *mut c_void,
+    ) -> Result<u64, Failure> {
+        if self.suspended.load(Ordering::Acquire) {
+            return Err(Failure::new(
+                UVStatus::UV_ERR_SUSPENDED,
+                "the session is suspended",
+            ));
+        }
+        if !self.has_active.load(Ordering::Acquire) {
+            return Err(Failure::new(UVStatus::UV_ERR_ENGINE, "no active photo"));
+        }
+        let f = callback.ok_or_else(|| Failure::invalid("callback is NULL"))?;
+        if max_pixels == 0 {
+            return Err(Failure::invalid("max_pixels is 0"));
+        }
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let request = PreviewRequest {
+            generation,
+            max_pixels,
+            draft,
+            callback: FrameCallback { f, ctx },
+        };
+        self.tx.send(Msg::Preview(request)).map_err(|_| stopped())?;
+        Ok(generation)
+    }
 }
 
 impl Drop for UVSession {
@@ -117,11 +219,34 @@ pub(crate) fn set_user_initiated_qos() {
     unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) };
 }
 
+/// caught runs f, turning a panic into None and a log line: engine work outside a command has
+/// no caller to report to, and the thread must live on.
+pub(crate) fn caught<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|p| log::error!("unveil: {what} panicked: {}", panic_message(&*p)))
+        .ok()
+}
+
 /// engine_main is the body of the engine thread. It reports the library open over `ready`, then
-/// serves messages until Shutdown or until every sender is gone, and closes the library on exit.
-/// A panic while handling one message becomes that message's UV_ERR_PANIC, so the thread lives on.
-fn engine_main(data_dir: PathBuf, rx: Receiver<Msg>, ready: Sender<Result<(), Failure>>) {
+/// serves messages until Shutdown, and closes the library on exit. `done` is handed to
+/// unveil-render for its RenderDone messages. A panic while handling one command becomes that
+/// command's UV_ERR_PANIC, so the thread lives on.
+fn engine_main(
+    data_dir: PathBuf,
+    rx: Receiver<Msg>,
+    done: Sender<Msg>,
+    has_active: Arc<AtomicBool>,
+    ready: Sender<Result<(), Failure>>,
+) {
     set_user_initiated_qos();
+    let worker = match RenderWorker::spawn(done) {
+        Ok(worker) => worker,
+        Err(e) => {
+            let message = format!("cannot start the render thread: {e}");
+            let _ = ready.send(Err(Failure::new(UVStatus::UV_ERR_ENGINE, message)));
+            return;
+        }
+    };
     let mut session = Session::new().with_fs();
     if let Err(e) = session.open_library(&data_dir, false) {
         let _ = ready.send(Err(Failure::engine(e)));
@@ -129,8 +254,15 @@ fn engine_main(data_dir: PathBuf, rx: Receiver<Msg>, ready: Sender<Result<(), Fa
     }
     // Spec 4.2: no XMP sidecars, whatever the library's prefs.json says.
     session.xmp.auto_write = false;
+    let mut engine = Engine {
+        session,
+        scheduler: PreviewScheduler::new(),
+        worker,
+        has_active,
+    };
+    engine.publish_active();
     let _ = ready.send(Ok(()));
-    for msg in rx {
+    while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Shutdown => break,
             Msg::Execute {
@@ -138,21 +270,127 @@ fn engine_main(data_dir: PathBuf, rx: Receiver<Msg>, ready: Sender<Result<(), Fa
                 params,
                 reply,
             } => {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    session.execute(&command, &params).map_err(Failure::engine)
-                }))
-                .unwrap_or_else(|p| {
-                    Err(Failure::new(
-                        UVStatus::UV_ERR_PANIC,
-                        format!("panic: {}", panic_message(&*p)),
-                    ))
-                });
+                let result = engine.execute(&command, &params);
+                engine.publish_active();
                 let _ = reply.send(result);
+            }
+            Msg::Preview(request) => {
+                if let Some(request) = engine.scheduler.submit(request) {
+                    engine.start(request);
+                }
+            }
+            Msg::RenderDone(done) => engine.finish(*done),
+        }
+    }
+    engine.shutdown(&rx);
+}
+
+/// Engine is the state of the engine thread: the Session, the preview scheduler and the render
+/// worker it feeds.
+struct Engine {
+    session: Session,
+    scheduler: PreviewScheduler<PreviewRequest>,
+    worker: RenderWorker,
+    has_active: Arc<AtomicBool>,
+}
+
+impl Engine {
+    fn execute(&mut self, command: &str, params: &Value) -> Result<Value, Failure> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.session.execute(command, params).map_err(Failure::engine)
+        }))
+        .unwrap_or_else(|p| {
+            Err(Failure::new(
+                UVStatus::UV_ERR_PANIC,
+                format!("panic: {}", panic_message(&*p)),
+            ))
+        })
+    }
+
+    fn publish_active(&self) {
+        let active = self.session.active().is_some();
+        self.has_active.store(active, Ordering::Release);
+    }
+
+    /// start sends request's job to the worker. When there is nothing to render (the photo is
+    /// gone) it counts as finished, and the next pending request gets its turn.
+    fn start(&mut self, mut request: PreviewRequest) {
+        loop {
+            if let Some(job) = self.job_for(&request) {
+                let work = Work {
+                    job,
+                    draft: request.draft,
+                    callback: request.callback,
+                };
+                if self.worker.run(work) {
+                    return;
+                }
+            }
+            match self.scheduler.finished(request.generation) {
+                Some(next) => request = next,
+                None => return,
             }
         }
     }
-    if let Err(e) = session.close_library() {
-        log::warn!("unveil: closing the library failed: {e}");
+
+    fn job_for(&mut self, request: &PreviewRequest) -> Option<lightcraft_engine::RenderJob> {
+        let active = self.session.active()?;
+        let max = request.max_pixels as usize;
+        let mut job = caught("render_job", || {
+            self.session.render_job(active, max, max, false, true)
+        })??;
+        if request.draft {
+            job = job.draft();
+        }
+        job.request_id = request.generation;
+        Some(job)
+    }
+
+    /// finish caches what the render decoded, delivers the frame if it is still the newest for
+    /// the active photo, then starts the pending request, if any.
+    fn finish(&mut self, done: RenderDone) {
+        if let Some(result) = &done.result {
+            caught("accept", || self.session.accept(result));
+            match &result.rendered {
+                Ok(rendered) => {
+                    let active = self.session.active().map(|p| p.0);
+                    if self
+                        .scheduler
+                        .should_deliver(done.generation, done.photo.0, active)
+                    {
+                        done.callback.call(rendered, done.generation, done.draft);
+                    }
+                }
+                Err(e) => log::warn!("unveil: preview {} failed: {e}", done.generation),
+            }
+        }
+        if let Some(next) = self.scheduler.finished(done.generation) {
+            self.start(next);
+        }
+    }
+
+    /// shutdown drops the pending request and waits up to 10 s for the one in flight, without
+    /// delivering it: after uv_session_free returns, no callback may run.
+    fn shutdown(mut self, rx: &Receiver<Msg>) {
+        self.scheduler.clear_pending();
+        let idle = self.scheduler.is_idle() || wait_for_render_done(rx);
+        self.worker.stop(idle);
+        if let Err(e) = self.session.close_library() {
+            log::warn!("unveil: closing the library failed: {e}");
+        }
+    }
+}
+
+/// wait_for_render_done drains rx until the in-flight RenderDone arrives (true) or 10 s pass.
+/// Anything else is dropped: the session is going away.
+fn wait_for_render_done(rx: &Receiver<Msg>) -> bool {
+    let deadline = Instant::now() + SHUTDOWN_RENDER_WAIT;
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Msg::RenderDone(_)) => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
     }
 }
 
@@ -266,20 +504,30 @@ fn not_implemented(name: &str) -> Failure {
     Failure::new(UVStatus::UV_ERR_ENGINE, format!("{name}: not implemented yet"))
 }
 
-/// uv_request_preview is a stub until the render ticket (T5): it returns 0 and sets
-/// uv_last_error to "not implemented yet".
+/// uv_request_preview asks for a preview of the active photo fitting max_pixels on its long
+/// edge, at draft quality when `draft`, and returns its generation (the first is 1) at once.
+/// The frame reaches `callback` later, on the engine thread, unless a newer request overtakes
+/// it or the active photo changes first. On failure it returns 0 with uv_last_error set: "no
+/// active photo" (UV_ERR_ENGINE) comes before a NULL callback (UV_ERR_INVALID_ARGUMENT).
+/// It may be called from any thread: requests that reach the engine out of order never let an
+/// older generation replace or follow a newer one, so the newest generation always wins.
 ///
 /// # Safety
-/// Same contract as the final version: `session` is NULL or live, `ctx` is passed back untouched.
+/// `session` is NULL or a live pointer from uv_session_new. `ctx` is passed back untouched and
+/// must stay valid, and usable from the engine thread, until uv_session_free returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn uv_request_preview(
-    _session: *mut UVSession,
-    _max_pixels: u32,
-    _draft: bool,
-    _callback: Option<UvFrameCb>,
-    _ctx: *mut c_void,
+    session: *mut UVSession,
+    max_pixels: u32,
+    draft: bool,
+    callback: Option<UvFrameCb>,
+    ctx: *mut c_void,
 ) -> u64 {
-    guard(|| Err(not_implemented("uv_request_preview")))
+    guard(|| {
+        // SAFETY: a live session per the contract; it is only borrowed for this call.
+        let session = unsafe { session.as_ref() }.ok_or_else(|| Failure::invalid("session is NULL"))?;
+        session.request_preview(max_pixels, draft, callback, ctx)
+    })
 }
 
 /// uv_suspend is a stub until the lifecycle ticket (T6): UV_ERR_ENGINE, "not implemented yet".

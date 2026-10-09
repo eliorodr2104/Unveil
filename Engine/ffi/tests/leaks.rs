@@ -13,9 +13,12 @@ fn execute_results_and_errors_do_not_leak() {
         for _ in 0..n {
             let cmd = CString::new("library.info").unwrap();
             let mut out = std::ptr::null_mut();
+            // SAFETY: s.raw is live; cmd and out outlive the call; NULL params means {}.
             unsafe { uv_execute(s.raw, cmd.as_ptr(), std::ptr::null(), &mut out) };
+            // SAFETY: out came from the uv_execute above (or is NULL) and is freed once.
             unsafe { uv_string_free(out) };
             let bad = CString::new("no.such.command").unwrap();
+            // SAFETY: s.raw is live; bad and out outlive the call; on failure out is set to NULL.
             unsafe { uv_execute(s.raw, bad.as_ptr(), std::ptr::null(), &mut out) };
             let _ = last_error();
         }

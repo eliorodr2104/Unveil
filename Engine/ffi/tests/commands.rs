@@ -1,37 +1,6 @@
 mod common;
 use common::*;
-use std::ffi::{CStr, CString};
 use unveil_ffi::*;
-
-fn exec(s: &TestSession, cmd: &str, params: &str) -> Result<serde_json::Value, (i32, String)> {
-    let c = CString::new(cmd).unwrap();
-    let p = CString::new(params).unwrap();
-    let mut out = std::ptr::null_mut();
-    // SAFETY: s.raw is a live session; c, p and out outlive the call.
-    let status = unsafe { uv_execute(s.raw, c.as_ptr(), p.as_ptr(), &mut out) };
-    if status != 0 {
-        return Err((status, last_error()));
-    }
-    // SAFETY: on UV_OK, out is a NUL-terminated string owned by us until uv_string_free.
-    let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_owned();
-    // SAFETY: out came from uv_execute and is freed once, after the copy above.
-    unsafe { uv_string_free(out) };
-    Ok(serde_json::from_str(&json).unwrap_or(serde_json::Value::Null))
-}
-
-/// import_fixture imports the gradient PNG and makes it the active photo; returns its id.
-fn import_fixture(s: &TestSession) -> u64 {
-    let path = fixture_png(s.dir.path());
-    let r = exec(
-        s,
-        "library.import",
-        &format!(r#"{{"paths":["{}"],"mode":"add"}}"#, path.display()),
-    )
-    .unwrap();
-    let id = photo_id_from_import(&r);
-    exec(s, "library.select", &format!(r#"{{"ids":[{id}],"active":{id}}}"#)).unwrap();
-    id
-}
 
 #[test]
 fn import_select_and_set_exposure() {

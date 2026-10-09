@@ -31,6 +31,7 @@ int32_t     uv_execute(UVSession *session, const char *command, const char *para
 void        uv_string_free(char *string);
 const char *uv_last_error(void);
 
+/// Callable from any thread; the newest generation always wins.
 uint64_t    uv_request_preview(UVSession *session, uint32_t max_pixels, bool draft,
                                uv_frame_cb callback, void *ctx);
 
