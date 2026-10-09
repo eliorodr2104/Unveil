@@ -1,0 +1,27 @@
+[package]
+name = "unveil-ffi"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "unveil_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# Exposes uv_test_panic for the bridge tests; never enabled in app builds.
+test-hooks = []
+
+[dependencies]
+lightcraft-engine = { workspace = true }
+lightcraft-gpu = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+png = { workspace = true }
+dhat = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
