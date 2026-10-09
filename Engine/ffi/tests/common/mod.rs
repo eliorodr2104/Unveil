@@ -59,7 +59,10 @@ pub mod tempdir_lite {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let p = std::env::temp_dir().join(format!("unveil-ffi-{}-{n}", std::process::id()));
+            // The clock ticks in microseconds on macOS, so parallel tests also need a counter.
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("unveil-ffi-{}-{n}-{seq}", std::process::id()));
             std::fs::create_dir_all(&p).unwrap();
             Dir(p)
         }
@@ -72,4 +75,25 @@ pub mod tempdir_lite {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+}
+
+/// photo_ids_from_import reads the ids of `library.import`'s `imported` array.
+pub fn photo_ids_from_import(result: &serde_json::Value) -> Vec<u64> {
+    result["imported"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `imported` array in {result}"))
+        .iter()
+        .map(|id| {
+            id.as_u64()
+                .unwrap_or_else(|| panic!("non-integer photo id in {result}"))
+        })
+        .collect()
+}
+
+/// photo_id_from_import is the first imported id; it panics, showing the JSON, when none was imported.
+pub fn photo_id_from_import(result: &serde_json::Value) -> u64 {
+    photo_ids_from_import(result)
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("nothing imported: {result}"))
 }
