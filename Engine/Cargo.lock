@@ -3870,6 +3870,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "unveil-ffi"
+version = "0.1.0"
+dependencies = [
+ "lightcraft-engine",
+ "lightcraft-gpu",
+ "log",
+ "png",
+ "serde_json",
+]
+
+[[package]]
 name = "v_frame"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
