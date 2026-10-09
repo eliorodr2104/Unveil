@@ -196,3 +196,22 @@ device, or with a second large photo loaded, is not covered by these runs. The o
 - The 24 MP soak was not run (as in the baseline).
 - The optimized Release build (`DerivedData-device-rs`, UUID `F88C886F-...`) is left installed on the iPad; the shared
   `Frameworks/UnveilEngine.xcframework` now holds the optimized engine.
+
+## After the GPU pool fix
+
+Same device, Release build (`DerivedData-device-pool`, engine rebuilt with `scripts/build-xcframework.sh`), same 600 s NEF
+soak command as C. Thermal was `nominal` at start (4 s probe) and in all 302 rows. Exit code 0.
+CSV: `Baseline/measurements/csv/pool-2026-10-09T210634Z.csv`; console `Baseline/measurements/pool-soak-console.log`.
+
+| Metric | Before pool fix (C) | After pool fix |
+|---|---|---|
+| Footprint at 4 / 30 / 60 s | 392 / n.r. / n.r. MiB | 380.1 / 390.1 / 391.4 MiB |
+| Footprint at 174 / 300 / 600 s | 902.0 / 902.0 / 902.0 MiB | 395.6 / 395.6 / 395.6 MiB (short excursions after the open up to 409.8 MiB, e.g. 405.7 at 64 s, 407.5 at 108 s, 409.8 at 264 s) |
+| Slope 30 to 300 s | about 3.0 MiB/s | **+0.017 MiB/s** (300 to 600 s: -0.0007) |
+| Steady median (300 to 600 s) | 902.0 MiB | **395.6 MiB** (excursions up to 409.8 MiB) |
+| Peak footprint | 916.5 MiB (plateau, 448 s) | 574.1 MiB (t = 0, open transient; 508.7 at 2 s; after 4 s at most 409.8) |
+| Min available | 7275.5 MiB | 7617.9 MiB |
+| Thermal | `nominal` | `nominal` |
+
+The ramp is gone: the footprint settles at about 395.6 MiB within about 60 s and stays flat to 600 s, with short excursions up to 409.8 MiB, 506 MiB below the
+previous plateau (and 261 MiB below the original baseline's 656.6 MiB steady median).
