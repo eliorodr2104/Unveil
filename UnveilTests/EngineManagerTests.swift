@@ -77,4 +77,13 @@ struct EngineManagerTests {
         }
         try manager.resume()
     }
+
+    @Test
+    func diagnosticAppGpuReturnsTheBackendState() async throws {
+        let manager = try makeManager(maxPixels: 256)
+
+        let json = try await manager.diagnostic("app.gpu", params: [String: String]())
+
+        #expect(json.contains("\"enabled\""))
+    }
 }

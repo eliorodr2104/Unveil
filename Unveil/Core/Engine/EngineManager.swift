@@ -26,7 +26,7 @@ import UnveilEngine
 /// Sendable. It is never mutated after init, and every `uv_*` function is documented as callable
 /// from any thread; the engine serialises the work on its own thread behind that handle.
 // Nonisolated: the queue and the engine thread call into it, and the app default is MainActor.
-nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
+nonisolated final class EngineManager: EngineDriving, EngineDiagnosing, @unchecked Sendable {
 
     let frames: FrameSink
 
@@ -217,9 +217,44 @@ nonisolated final class EngineManager: EngineDriving, @unchecked Sendable {
         throw message == "the session is suspended" ? .suspended(message) : .engine(message)
     }
 
+    /// diagnostic runs one engine command and returns its JSON result untouched. It is the single
+    /// door for the diagnostics (`app.gpu`, `develop.reset`, `library.memory`), on the command queue
+    /// like every other command. Never send `app.gpu` anything but `{}`: it would change the preference.
+    func diagnostic(_ command: String, params: some Encodable & Sendable) async throws(EngineError) -> String {
+        try await onQueue { () throws(EngineError) -> String in
+            let result = try self.execute(command, params)
+            return String(decoding: result, as: UTF8.self)
+        }
+    }
+
+    /// recordState queues a read of `app.gpu` on the command queue and appends it to `engine.jsonl`.
+    /// It returns at once, so main never waits on it, and the read lands behind any command in flight.
+    func recordState(event: String) {
+        queue.async {
+            let gpu: String
+
+            do throws(EngineError) {
+                gpu = String(decoding: try self.execute("app.gpu", [String: String]()), as: UTF8.self)
+            } catch {
+                gpu = EngineStateLog.errorJSON(error.message)
+            }
+
+            EngineStateLog.append(
+                event         : event,
+                gpu           : gpu,
+                possibleTears : nil
+            )
+        }
+    }
+
     /// suspend stops GPU work for the background and blocks until the render in flight is done,
     /// at most 2 s. On `.timeout` the session is suspended anyway, so `resume()` is still needed.
+    ///
+    /// Whatever the outcome, it records the engine state afterwards: `resume()` clears the engine's
+    /// last GPU fallback, so a fallback during the background is only visible between the two.
     func suspend() throws(EngineError) {
+        defer { recordState(event: "suspend") }
+
         try Self.check(uv_suspend(session))
     }
 

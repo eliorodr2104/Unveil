@@ -45,6 +45,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
         memoryMonitor.start()
         lifecycleObserver.start()
+        engine.recordState(event: "launch")
 
         self.engine            = engine
         self.memoryMonitor     = memoryMonitor

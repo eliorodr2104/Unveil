@@ -9,8 +9,8 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// EditorViewController is the editor screen: the Metal canvas fills the view, the SwiftUI
-/// adjustment panel sits on the trailing side, and the navigation bar carries "Open" (and, in debug
-/// builds, the diagnostics menu).
+/// adjustment panel sits on the trailing side, and the navigation bar carries "Open" and the
+/// diagnostics menu.
 ///
 /// The document picker delegate conformance lives in this primary declaration on purpose: the class
 /// is generic, and an extension of a generic class cannot add an Objective-C conformance.
@@ -18,23 +18,23 @@ import UniformTypeIdentifiers
 /// Errors are shown from `updateProperties()`. UIKit tracks the `@Observable` reads made there, so a
 /// new `errorMessage` calls it again and the alert appears; its OK button clears the message through
 /// `dismissError()`.
-final class EditorViewController<Engine: EngineDriving, Importer: PhotoImporting>: UIViewController,
+final class EditorViewController<Engine: EngineDriving & EngineDiagnosing, Importer: PhotoImporting>: UIViewController,
     UIDocumentPickerDelegate {
 
     private static var panelWidth: CGFloat { 320 }
 
     private let viewModel: EditorViewModel<Engine, Importer>
+    private let engine   : Engine
     private let canvas   : CanvasView
-    private let frames   : FrameSink
 
     init(
         viewModel: EditorViewModel<Engine, Importer>,
-        frames   : FrameSink,
+        engine   : Engine,
         device   : some MTLDevice
     ) {
         self.viewModel = viewModel
-        self.frames    = frames
-        self.canvas    = CanvasView(frames: frames, device: device)
+        self.engine    = engine
+        self.canvas    = CanvasView(frames: engine.frames, device: device)
 
         super.init(nibName: nil, bundle: nil)
     }
@@ -123,10 +123,12 @@ final class EditorViewController<Engine: EngineDriving, Importer: PhotoImporting
             primaryAction : UIAction { [weak self] _ in self?.presentDocumentPicker() }
         )
 
-        #if DEBUG
-        let diagnosticsMenu = DiagnosticsMenu.make(frames: frames) { [viewModel] in
-            viewModel.isPhotoOpen
-        }
+        let diagnosticsMenu = DiagnosticsMenu.make(
+            engine            : engine,
+            isPhotoOpen       : { [viewModel] in viewModel.isPhotoOpen },
+            possibleTearCount : { [canvas] in canvas.possibleTearCount },
+            present           : { [weak self] alert in self?.present(alert, animated: true) }
+        )
 
         let diagnostics = UIBarButtonItem(
             title : "Diagnostics",
@@ -135,9 +137,6 @@ final class EditorViewController<Engine: EngineDriving, Importer: PhotoImporting
         )
 
         navigationItem.leftBarButtonItems = [open, diagnostics]
-        #else
-        navigationItem.leftBarButtonItem = open
-        #endif
     }
 
     /// presentDocumentPicker opens the Files picker on the original file, not a copy: PhotoImporter

@@ -69,11 +69,42 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
         let editor = EditorViewController(
             viewModel : viewModel,
-            frames    : engine.frames,
+            engine    : engine,
             device    : device
         )
 
+        runLaunchCommand(engine: engine)
+
         return UINavigationController(rootViewController: editor)
+    }
+
+    /// runLaunchCommand runs the diagnostic named by the `-UnveilRun` launch argument, once per
+    /// launch, so an agent can drive the device with no taps (`devicectl device process launch`).
+    ///
+    /// `golden` exports the reference images, prints its progress and ends the process: `exit(0)` when
+    /// every image was written, `exit(1)` otherwise. The exit is allowed only in this agent-driven
+    /// mode, where nobody is editing. `state` appends one `engine.jsonl` line and stays open.
+    private func runLaunchCommand(engine: EngineManager) {
+        guard let command = UserDefaults.standard.string(forKey: "UnveilRun") else { return }
+
+        Task {
+            // The engine is suspended while the app is not active: wait for the first activation.
+            while UIApplication.shared.applicationState != .active {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+
+            switch command {
+                case "golden":
+                    let summary = await GoldenExporter(engine: engine).run()
+                    exit(summary.failures.isEmpty ? 0 : 1)
+
+                case "state":
+                    engine.recordState(event: "run-state")
+
+                default:
+                    print("unknown -UnveilRun value: \(command)")
+            }
+        }
     }
 
     /// makeUnavailableViewController is the screen shown when the engine did not open: without it
