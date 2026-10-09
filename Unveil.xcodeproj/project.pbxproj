@@ -32,7 +32,6 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
-				Unveil.entitlements,
 			);
 			target = 000000000000000100000000 /* Unveil */;
 		};
