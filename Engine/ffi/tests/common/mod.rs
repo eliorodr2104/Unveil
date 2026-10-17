@@ -91,7 +91,11 @@ pub fn import_png(s: &TestSession, path: &Path) -> u64 {
         &format!(r#"{{"paths":["{}"],"mode":"add"}}"#, path.display()),
     );
     let id = photo_id_from_import(&r);
-    exec_ok(s, "library.select", &format!(r#"{{"ids":[{id}],"active":{id}}}"#));
+    exec_ok(
+        s,
+        "library.select",
+        &format!(r#"{{"ids":[{id}],"active":{id}}}"#),
+    );
     id
 }
 
@@ -157,7 +161,8 @@ pub mod tempdir_lite {
             // The clock ticks in microseconds on macOS, so parallel tests also need a counter.
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let p = std::env::temp_dir().join(format!("unveil-ffi-{}-{n}-{seq}", std::process::id()));
+            let p =
+                std::env::temp_dir().join(format!("unveil-ffi-{}-{n}-{seq}", std::process::id()));
             std::fs::create_dir_all(&p).unwrap();
             Dir(p)
         }

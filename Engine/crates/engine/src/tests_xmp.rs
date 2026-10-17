@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! XMP sidecars end to end: save → delete library → re-import restores edits; auto-write; foreign
 //! `crs:` sidecars; DNG-embedded XMP; read metadata from file (undoable).
 
@@ -18,7 +19,7 @@ pub(crate) fn temp_dir(tag: &str) -> PathBuf {
 fn write_png(path: &Path, seed: u8) {
     let (w, h) = (40usize, 24usize);
     let data: Vec<[u8; 4]> = (0..w * h).map(|i| [(i % w * 6) as u8, (i / w * 9) as u8, seed, 255]).collect();
-    let img = lightcraft_raster::Rgba8 { width: w, height: h, data };
+    let img = lightcraft_raster::Rgba8 { width: w, height: h, data: lightcraft_raster::Buffer::Heap(data) };
     let bytes = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
     std::fs::write(path, bytes).unwrap();
 }
@@ -416,7 +417,7 @@ fn demo_photos_have_no_sidecar() {
 fn all_metadata_lists_exif_and_xmp() {
     let dir = temp_dir("allmeta");
     let path = dir.join("tagged.jpg");
-    let img = lightcraft_raster::Rgba8 { width: 16, height: 8, data: vec![[90, 120, 200, 255]; 128] };
+    let img = lightcraft_raster::Rgba8 { width: 16, height: 8, data: vec![[90, 120, 200, 255]; 128].into() };
     let exif = lightcraft_meta::write_exif(&lightcraft_meta::Metadata { make: Some("Maker".into()), iso: Some(800), ..Default::default() });
     let meta = lightcraft_codecs::EncodeMeta { exif: Some(&exif), ..Default::default() };
     let jpg = lightcraft_codecs::encode_jpeg(&lightcraft_codecs::EncodeImage::rgba8(&img), 90, Default::default(), &meta).unwrap();
@@ -659,7 +660,7 @@ fn dng_export_compression_choices() {
 fn write_jpeg(path: &Path, capture: Option<&str>) {
     let (w, h) = (32usize, 24usize);
     let data: Vec<[u8; 4]> = (0..w * h).map(|i| [(i % w * 7) as u8, (i / w * 9) as u8, 90, 255]).collect();
-    let img = lightcraft_raster::Rgba8 { width: w, height: h, data };
+    let img = lightcraft_raster::Rgba8 { width: w, height: h, data: lightcraft_raster::Buffer::Heap(data) };
     let exif = capture.map(|c| {
         lightcraft_meta::write_exif(&lightcraft_meta::Metadata { capture_time: lightcraft_meta::DateTime::parse_iso(c), ..Default::default() })
     });

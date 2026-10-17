@@ -52,7 +52,7 @@ nonisolated enum MemoryMapReport {
         return "MM " + String(decoding: data, as: UTF8.self)
     }
 
-    private static func footprint() -> [String: UInt64] {
+    static func footprint() -> [String: UInt64] {
         var info  = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
 
@@ -76,7 +76,7 @@ nonisolated enum MemoryMapReport {
         ]
     }
 
-    private static func heap() -> [String: UInt64] {
+    static func heap() -> [String: UInt64] {
         var statistics = malloc_statistics_t()
         malloc_zone_statistics(nil, &statistics)
 

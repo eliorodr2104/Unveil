@@ -10,7 +10,11 @@
 
 pub mod blur;
 pub mod histogram;
+pub mod memory_trace;
 pub mod resample;
+// Modified for Unveil (2026-10-17): explicit returnable storage without weakening safe raster code.
+mod buffer;
+pub use buffer::Buffer;
 
 pub use histogram::Histogram;
 
@@ -48,7 +52,7 @@ pub fn par_join<A: Send, B: Send>(a: impl FnOnce() -> A + Send, b: impl FnOnce()
 pub struct Image<T> {
     pub width: usize,
     pub height: usize,
-    pub data: Vec<T>,
+    pub data: Buffer<T>,
 }
 
 pub type Rgb32f = Image<[f32; 3]>;
@@ -57,10 +61,16 @@ pub type Plane = Image<f32>;
 
 impl<T: Copy + Default> Image<T> {
     pub fn new(width: usize, height: usize) -> Self {
-        Self { width, height, data: vec![T::default(); width * height] }
+        Self { width, height, data: vec![T::default(); width * height].into() }
+    }
+    /// A disposable decode image whose large backing is returned directly on final destruction.
+    pub fn new_returnable(width: usize, height: usize) -> Self {
+        assert!(width.checked_mul(height).is_some(), "image dimensions overflow");
+        let len = width * height;
+        Self { width, height, data: Buffer::filled_returnable(len, T::default()) }
     }
     pub fn filled(width: usize, height: usize, v: T) -> Self {
-        Self { width, height, data: vec![v; width * height] }
+        Self { width, height, data: vec![v; width * height].into() }
     }
     pub fn from_fn(width: usize, height: usize, f: impl Fn(usize, usize) -> T) -> Self {
         let mut data = Vec::with_capacity(width * height);
@@ -69,7 +79,7 @@ impl<T: Copy + Default> Image<T> {
                 data.push(f(x, y));
             }
         }
-        Self { width, height, data }
+        Self { width, height, data: data.into() }
     }
     #[inline]
     pub fn get(&self, x: usize, y: usize) -> T {
@@ -151,7 +161,7 @@ impl<T: Copy + Default> Image<T> {
         for y in y0..y0 + h {
             data.extend_from_slice(&self.data[y * self.width + x0..y * self.width + x0 + w]);
         }
-        Self { width: w, height: h, data }
+        Self { width: w, height: h, data: data.into() }
     }
     /// [`Self::crop`] in place: rows move to the front of the same buffer (no second image).
     pub fn into_crop(mut self, x0: usize, y0: usize, w: usize, h: usize) -> Self {

@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! Library preferences: import defaults (raw / other / per camera) applied by import, and their
 //! persistence in prefs.json.
 
@@ -35,7 +36,7 @@ fn dng(dir: &Path, name: &str, make: &str, model: &str) {
 fn png(path: &Path) {
     let (w, h) = (24usize, 16usize);
     let data: Vec<[u8; 4]> = (0..w * h).map(|i| [(i * 7) as u8, (i * 3) as u8, 90, 255]).collect();
-    let img = lightcraft_raster::Rgba8 { width: w, height: h, data };
+    let img = lightcraft_raster::Rgba8 { width: w, height: h, data: lightcraft_raster::Buffer::Heap(data) };
     let bytes = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
     std::fs::write(path, bytes).unwrap();
 }
@@ -272,7 +273,7 @@ fn resizing_the_disk_cache_keeps_the_cache_and_its_thumbnails() {
     s.open_library(&lib, false).unwrap();
     let cache = s.media.rendered.clone();
     let key = lightcraft_preview::hash_bytes(b"thumbnail");
-    let img = lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[10, 20, 30, 255]; 16] };
+    let img = lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[10, 20, 30, 255]; 16].into() };
     cache.put(key, Arc::new(img));
     let generation = cache.generation();
     s.execute("library.preferences", &json!({"cacheMb": 300})).unwrap();
@@ -300,7 +301,7 @@ fn reopening_a_library_retires_the_old_cache_so_its_jobs_cannot_write_after_a_cl
     let (old, key) = job.cache.clone().unwrap();
     // a thumbnail written before the reopen is still valid afterwards
     let kept = lightcraft_preview::hash_bytes(b"kept thumbnail");
-    let img = lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[10, 20, 30, 255]; 16] };
+    let img = lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[10, 20, 30, 255]; 16].into() };
     old.put(kept, Arc::new(img.clone()));
     s.open_library(&lib, false).unwrap();
     assert!(!Arc::ptr_eq(&old, &s.media.rendered));

@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! Dust-spot detection: sensor dust shows as small, soft, darker-than-surroundings round spots
 //! on smooth areas (sky, walls). Classical: a blurred copy gives the surroundings, the darkening
 //! is compared with the local texture so detail doesn't trigger it, and each candidate blob
@@ -101,7 +102,7 @@ mod tests {
                 [b, b, (b as f32 * 1.1).min(255.0) as u8, 255]
             })
             .collect();
-        let found = detect(&Rgba8 { width: w, height: h, data }, 50.0);
+        let found = detect(&Rgba8 { width: w, height: h, data: lightcraft_raster::Buffer::Heap(data) }, 50.0);
         assert_eq!(found.len(), 3, "{found:?}");
         for (cx, cy, _) in spots {
             assert!(

@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: half storage with explicit f32 loads; see Engine/CHANGES.md.
 // The per-pixel stage: a straight port of `lightcraft_pipeline::finish` (keep in step with it).
 // Bindings: img (rgb, pre-exposure), log_l, base, clar, tex, dark, masks (NMASK planes, then the
 // blurred chromaticity when HAS_CHROMA), aux
@@ -265,11 +266,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = w * h;
     let gain = pf(F_GAIN);
     let ev = pf(F_EV);
-    var c = vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]);
+    var c = vec3<f32>(load_img(3u * i), load_img(3u * i + 1u), load_img(3u * i + 2u));
     if (gain != 1.0) {
         c = c * gain;
     }
-    let l_pre = log_l[i];
+    let l_pre = load_log_l(i);
     let l0 = l_pre + ev;
 
     // --- local (mask) contributions
@@ -301,7 +302,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- local Moiré (and the colour part of Noise): chromaticity towards its blur
     let mt = clamp(lt[15] + 0.5 * max(l_noise, 0.0), -1.0, 1.0);
     if (mt != 0.0 && pu(F_HAS_CHROMA) != 0u) {
-        let raw = vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]);
+        let raw = vec3<f32>(load_img(3u * i), load_img(3u * i + 1u), load_img(3u * i + 2u));
         let y = lum2020(c);
         let ch0 = raw / max(lum2020(raw), 1e-6);
         let o = nm * n + 3u * i;
@@ -314,7 +315,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let yd = max(lum2020(c), 1e-6);
         let purple = (min(c.x, c.z) - c.y) / yd;
         let green = (c.y - max(c.x, c.z)) / yd;
-        let k = df * sstep(0.04, 0.3, abs(l_pre - tex[i])) * max(sstep(0.02, 0.2, purple), sstep(0.02, 0.2, green));
+        let k = df * sstep(0.04, 0.3, abs(l_pre - load_tex(i))) * max(sstep(0.02, 0.2, purple), sstep(0.02, 0.2, green));
         if (k > 0.0) {
             let y = lum2020(c);
             c = c + (y - c) * k;
@@ -324,7 +325,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- dehaze (scene linear)
     let dz = pf(F_DEHAZE) + lt[10];
     if (dz != 0.0 && pu(F_HAS_DARK) != 0u) {
-        let d = clamp(dark[i] / pf(F_AIR_PRE), 0.0, 1.0);
+        let d = clamp(load_dark(i) / pf(F_AIR_PRE), 0.0, 1.0);
         let air = pf(F_AIR);
         if (dz > 0.0) {
             let t = max(1.0 - 0.95 * min(dz, 1.0) * d, 0.12);
@@ -352,7 +353,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         l1 = log_lum(c);
     }
     let shift = l1 - l0;
-    let base = base_p[i] + ev + shift;
+    let base = load_base_p(i) + ev + shift;
     var delta = 0.0;
     let hh = pf(F_HL) + lt[4];
     let ss = pf(F_SH) + lt[5];
@@ -372,7 +373,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let cl = pf(F_CLAR) + lt[9];
     if (cl != 0.0 && pu(F_HAS_CLAR) != 0u) {
-        let det = clamp(l_pre - clar[i], -2.5, 2.5);
+        let det = clamp(l_pre - load_clar(i), -2.5, 2.5);
         let q = base / 3.2;
         let mid = exp(-(q * q));
         delta += cl * 0.85 * det * (0.35 + 0.65 * mid);
@@ -380,7 +381,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tx = pf(F_TEX) + lt[8];
     let sp = lt[13] * 0.6 + pf(F_SHARPEN);
     if ((tx != 0.0 || sp != 0.0) && pu(F_HAS_TEX) != 0u) {
-        let det = l_pre - tex[i];
+        let det = l_pre - load_tex(i);
         let tame = 1.0 - 0.6 * sstep(0.4, 1.6, abs(det));
         delta += tx * 1.1 * clamp(det, -1.0, 1.0) * tame;
         if (sp != 0.0) {
@@ -394,7 +395,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     // local Noise: smooth (or, negative, boost) small-amplitude detail, keep edges
     if (l_noise != 0.0 && pu(F_HAS_TEX) != 0u) {
-        let det = l_pre - tex[i];
+        let det = l_pre - load_tex(i);
         delta -= clamp(l_noise, -1.0, 1.0) * 0.9 * det * (1.0 - sstep(0.1, 0.5, abs(det)));
     }
     if (delta != 0.0) {

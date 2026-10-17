@@ -39,6 +39,7 @@ extension EditorLaunchRunner {
     /// beginCost resets the engine's render totals and the canvas's GPU time and samples the process.
     static func beginCost(engine: EngineManager) async -> CostStart {
         _ = try? await engine.diagnostic("unveil.renders", params: ["reset": true])
+        _ = try? await engine.diagnostic("unveil.pool", params: ["reset": true])
         CanvasGPUTime.reset()
         CanvasGPUTime.isActive = true
         SliderLatencyLog.start()
@@ -57,6 +58,7 @@ extension EditorLaunchRunner {
         let end      = ProcessCostProbe.sample()
         let gpu      = CanvasGPUTime.totals()
         let renders  = (try? await engine.diagnostic("unveil.renders", params: ["reset": false])) ?? "{}"
+        let pool     = (try? await engine.diagnostic("unveil.pool", params: ["reset": false])) ?? "{}"
 
         CanvasGPUTime.isActive = false
 
@@ -69,6 +71,7 @@ extension EditorLaunchRunner {
             "canvasGpu" : ["passes": gpu.passes, "seconds": gpu.seconds, "longestSeconds": gpu.longest],
             "sliderToFrame": SliderLatencyLog.stop(),
             "renders"   : (try? JSONSerialization.jsonObject(with: Data(renders.utf8))) ?? renders,
+            "pool"      : (try? JSONSerialization.jsonObject(with: Data(pool.utf8))) ?? pool,
         ]
 
         emit("COST", object)
@@ -162,10 +165,15 @@ extension EditorLaunchRunner {
     }
 
     /// runMemoryMap is the rest of the `-UnveilMemoryMap` run, after the "open" moment: a memory line
-    /// and a COST line (the power of the hold) at fit after 15 s, at 100 % once the first full window
+    /// and a COST line (the power of the hold) at fit after 5 and 15 s, at 100 % once the first full window
     /// landed and 10 s more, and back at fit 10 s and 30 s after the zoom out (the window memory is
     /// released 2 s after it). FootprintSampler writes the footprint CSV meanwhile.
-    static func runMemoryMap(_ canvas: CanvasView, engine: EngineManager, firstFrameAt: ContinuousClock.Instant) async {
+    static func runMemoryMap(
+        _ canvas     : CanvasView,
+        engine       : EngineManager,
+        firstFrameAt : ContinuousClock.Instant,
+        cycles       : Int = 1
+    ) async -> Bool {
         let sampler = FootprintSampler()
 
         UIApplication.shared.isIdleTimerDisabled = true
@@ -181,30 +189,89 @@ extension EditorLaunchRunner {
         }
 
         await printLoads("open-to-fit", engine: engine)
-        await hold(15, moment: "fit")
+        await hold(max(0, 5 - firstFrameAt.duration(to: .now) / .seconds(1)), moment: "fit-5s")
+        await hold(10, moment: "fit")
         await printLoads("fit-hold", engine: engine)
 
-        let zoomed = ContinuousClock.now
-        canvas.zoom(toPercent: 100)
+        for cycle in 1 ... cycles {
+            func label(_ name: String) -> String { cycle == 1 ? name : "\(name)-cycle-\(cycle)" }
+            let previousWindow = engine.frames.published().window?.generation ?? 0
+            let zoomed = ContinuousClock.now
+            canvas.zoom(toPercent: 100)
 
-        while zoomed.duration(to: .now) < .seconds(30) {
-            if let window = engine.frames.published().window, !window.isDraft { break }
+            while zoomed.duration(to: .now) < .seconds(30) {
+                if let window = engine.frames.published().window,
+                   window.generation > previousWindow,
+                   !window.isDraft { break }
 
-            try? await Task.sleep(for: .milliseconds(5))
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+
+            guard let window = engine.frames.published().window,
+                  window.generation > previousWindow,
+                  !window.isDraft
+            else {
+                await sampler.stop()
+                UIApplication.shared.isIdleTimerDisabled = false
+                print("measure: full window timed out")
+                return false
+            }
+
+            print("measure: first full window after \(zoomed.duration(to: .now))")
+            await printLoads(label("zoom-in"), engine: engine)
+            await hold(10, moment: label("zoom-100"))
+
+            canvas.zoomToFit()
+            await hold(10, moment: label("fit-after-10s"))
+            await hold(20, moment: label("fit-after-30s"))
+            await printLoads(label("zoom-out"), engine: engine)
         }
-
-        print("measure: first full window after \(zoomed.duration(to: .now))")
-        await printLoads("zoom-in", engine: engine)
-        await hold(10, moment: "zoom-100")
-
-        canvas.zoomToFit()
-        await hold(10, moment: "fit-after-10s")
-        await hold(20, moment: "fit-after-30s")
-        await printLoads("zoom-out", engine: engine)
 
         await sampler.stop()
         UIApplication.shared.isIdleTimerDisabled = false
         print("measure: memory map done")
+        return true
+    }
+
+    /// probePool isolates free-buffer reclamation after the photo has settled, then measures the
+    /// first edit with the same live source and stages. This explicit probe disables automatic trim.
+    static func probePool(
+        _ viewModel  : EditorViewModel<EngineManager, PhotoImporter>,
+        engine       : EngineManager,
+        firstFrameAt : ContinuousClock.Instant
+    ) async -> Bool {
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer { UIApplication.shared.isIdleTimerDisabled = false }
+
+        func edit(_ label: String, exposure: Double) async -> Bool {
+            let previous = engine.frames.latest()?.generation ?? 0
+            let cost = await beginCost(engine: engine)
+            await viewModel.drag(.exposure, to: exposure)
+            await viewModel.endDrag(.exposure)
+            let started = ContinuousClock.now
+            var completed = false
+            while started.duration(to: .now) < .seconds(15) {
+                if let frame = engine.frames.latest(), frame.generation > previous, !frame.isDraft {
+                    completed = true
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            // Let the canvas present the accepted frame before reading presentation latency.
+            try? await Task.sleep(for: .milliseconds(250))
+            await printCost(cost, label: label, isComplete: completed, engine: engine)
+            await printLoads(label, engine: engine)
+            return completed
+        }
+
+        try? await Task.sleep(for: .seconds(15))
+        guard await edit("pool-warm-edit", exposure: 0.25) else { return false }
+        try? await Task.sleep(for: .seconds(15))
+        await printMemoryMap("pool-before-trim", since: firstFrameAt, engine: engine)
+        _ = try? await engine.diagnostic("unveil.pool", params: ["trimFreeBytes": UInt64(0)])
+        try? await Task.sleep(for: .milliseconds(200))
+        await printMemoryMap("pool-after-trim", since: firstFrameAt, engine: engine)
+        return await edit("pool-first-after-trim", exposure: 0.5)
     }
 
     /// prepareTimeline clears the engine's load log (launch work is not the open) and times a cold copy

@@ -146,8 +146,15 @@ final class EditorLaunchRunner {
             _ = try? await engine.diagnostic("app.gpu", params: [String: String]())
 
             // The bridge's timers and logs are off in a normal launch: only these options switch them on.
-            if options.reportsTimeline || options.reportsMemoryMap || options.reportsCost {
+            if options.reportsTimeline || options.reportsMemoryMap || options.reportsCost || options.reportsDecodeMemory
+                || options.poolLimitBytes != nil || options.disablesPoolIdle || options.probesPool {
                 _ = try? await engine.diagnostic("unveil.diagnostics", params: ["enabled": true])
+            }
+            if let limit = options.poolLimitBytes {
+                _ = try? await engine.diagnostic("unveil.pool", params: ["limitBytes": limit])
+            }
+            if options.disablesPoolIdle || options.probesPool {
+                _ = try? await engine.diagnostic("unveil.pool", params: ["idleTrim": false])
             }
 
             let rawURL = URL.documentsDirectory.appending(path: "raw/\(fileName)")
@@ -160,10 +167,20 @@ final class EditorLaunchRunner {
                 OpenTimeline.start()
             }
 
+            let decodeSampler = options.reportsDecodeMemory ? DecodeMemorySampler() : nil
+            if let decodeSampler {
+                _ = try? await engine.diagnostic("unveil.decode-memory", params: ["enabled": true])
+                decodeSampler.start(device: engine.frames.buffer(at: 0).device)
+            }
+
             print("measure: opening \(fileName)")
             await session.open(pickedURL: rawURL)
 
             guard await Self.waitForFullFrame(in: engine.frames) else {
+                await decodeSampler?.stop()
+                if options.reportsDecodeMemory {
+                    _ = try? await engine.diagnostic("unveil.decode-memory", params: ["enabled": false])
+                }
                 print("measure: no full frame for \(fileName): \(viewModel.errorMessage ?? "timed out")")
                 if options.exitsAfterSweep { exit(1) }
                 return
@@ -181,7 +198,8 @@ final class EditorLaunchRunner {
                 try? await Task.sleep(for: .seconds(3))
                 await Self.printTimeline(engine: engine)
 
-                if options.exitsAfterSweep, !options.reportsMemoryMap, !options.reportsCost, options.sweepSeconds == nil {
+                if options.exitsAfterSweep, !options.reportsMemoryMap, !options.reportsCost,
+                   !options.reportsDecodeMemory, options.sweepSeconds == nil {
                     exit(0)
                 }
             } else if options.reportsMemoryMap {
@@ -189,9 +207,42 @@ final class EditorLaunchRunner {
             }
 
             if options.reportsMemoryMap {
-                await Self.runMemoryMap(canvas, engine: engine, firstFrameAt: firstFrameAt)
-                if options.exitsAfterSweep { exit(0) }
+                let completed = await Self.runMemoryMap(
+                    canvas,
+                    engine       : engine,
+                    firstFrameAt : firstFrameAt,
+                    cycles       : options.memoryCycles
+                )
+                await decodeSampler?.stop()
+                if options.reportsDecodeMemory {
+                    let trace = (try? await engine.diagnostic("unveil.decode-memory", params: [String: String]())) ?? "{}"
+                    print("DM-ALLOC " + trace)
+                    _ = try? await engine.diagnostic("unveil.decode-memory", params: ["enabled": false])
+                }
+                if options.exitsAfterSweep { exit(completed ? 0 : 1) }
                 return
+            }
+
+            await decodeSampler?.stop()
+            if options.reportsDecodeMemory {
+                let trace = (try? await engine.diagnostic("unveil.decode-memory", params: [String: String]())) ?? "{}"
+                print("DM-ALLOC " + trace)
+                _ = try? await engine.diagnostic("unveil.decode-memory", params: ["enabled": false])
+            }
+
+            if options.probesPool {
+                let completed = await Self.probePool(
+                    viewModel,
+                    engine       : engine,
+                    firstFrameAt : firstFrameAt
+                )
+                if options.exitsAfterSweep { exit(completed ? 0 : 1) }
+                return
+            }
+
+            if options.reportsDecodeMemory, options.exitsAfterSweep, !options.reportsCost,
+               options.sweepSeconds == nil, !options.cyclesZoom {
+                exit(0)
             }
 
             if let panel = options.openPanel {

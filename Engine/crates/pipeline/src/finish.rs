@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! The per-pixel stage: everything after the spatial planes are ready, in one parallel pass.
 
 use lightcraft_color::luminance_2020;
@@ -274,7 +275,7 @@ pub(crate) fn finish(p: &Prepared, s: &DevelopSettings, frame: &Frame, info: &So
             [x[0], x[1], x[2], 255]
         }
     });
-    Rgba8 { width: w, height: h, data }
+    Rgba8 { width: w, height: h, data: data.into() }
 }
 
 /// [`finish`] into 16-bit display-encoded or 32-bit float linear samples (output primaries).

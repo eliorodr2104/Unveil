@@ -1,9 +1,9 @@
-// uv.h: C ABI of the Unveil engine bridge. Version 6.
+// uv.h: C ABI of the Unveil engine bridge. Version 7.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
 
-#define UV_ABI_VERSION 6
+#define UV_ABI_VERSION 7
 
 typedef enum UVStatus {
     UV_OK                    =  0,
@@ -32,7 +32,7 @@ typedef struct UVHistogram {
 } UVHistogram;
 
 /// One delivered frame: `height` rows of `stride` bytes of RGBA8. A whole-frame preview has
-/// `window` false, frame_width/frame_height equal to width/height and x = y = 0. A window
+/// `window` false, frame_width/frame_height equal to display_width/display_height and x = y = 0. A window
 /// (uv_request_window) has `window` true and sits at (x, y) of a frame_width x frame_height frame.
 /// `fallback` marks the whole frame answering a window that could not render alone: it replaces
 /// the window shown. native_width x native_height is the whole frame at the photo's own resolution
@@ -46,6 +46,8 @@ typedef struct UVHistogram {
 /// for a failure; like the pixels it is valid only during the call. A window carries one only when
 /// its request asked for it (ABI 6) and its small whole frame of the same look rendered: the whole
 /// photo's. If that small frame fails, the window still arrives, with `histogram` NULL.
+/// display_width/display_height (ABI 7) are logical coverage in the placement coordinate system.
+/// Drafts may have fewer physical pixels in width/height; Full keeps physical and display sizes equal.
 typedef struct UVFrame {
     const uint8_t *rgba;
     uint32_t       width;
@@ -64,6 +66,8 @@ typedef struct UVFrame {
     int32_t        status;
     const char    *error;
     const UVHistogram *histogram;
+    uint32_t       display_width;
+    uint32_t       display_height;
 } UVFrame;
 
 /// Called on the engine thread; `frame` and its pixels are valid only during the call.
@@ -93,8 +97,8 @@ uint64_t    uv_request_preview(UVSession *session, uint32_t max_pixels, bool dra
 uint64_t    uv_request_window(UVSession *session, uint32_t full_w, uint32_t full_h,
                               uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool draft,
                               bool before, bool histogram, uv_frame_cb callback, void *ctx);
-/// Frees what windows keep resident (their stages, then, once no render is in flight, the GPU
-/// buffer pool with the shared full-size source); never waits. A later window rebuilds them.
+/// Frees window Full/Draft stages, then the full source and buffer pool once no render is in flight.
+/// A tight-crop preview keeps a full source it still uses; a later window rebuilds evicted data.
 void        uv_release_windows(UVSession *session);
 
 /// UV_OK once no render is in flight (at most 2 s, else UV_ERR_TIMEOUT and the session stays

@@ -2171,6 +2171,7 @@ dependencies = [
  "libc",
  "lightcraft-color",
  "lightcraft-geom",
+ "lightcraft-sysmem",
  "proptest",
  "rayon",
  "serde",
@@ -2225,6 +2226,10 @@ dependencies = [
 [[package]]
 name = "lightcraft-sysmem"
 version = "0.4.0"
+dependencies = [
+ "allocator-api2",
+ "libc",
+]
 
 [[package]]
 name = "lightcraft-tiff"
@@ -3947,6 +3952,7 @@ name = "unveil-ffi"
 version = "0.1.0"
 dependencies = [
  "dhat",
+ "jpeg-encoder",
  "lightcraft-engine",
  "lightcraft-gpu",
  "log",

@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: half storage with explicit f32 loads; see Engine/CHANGES.md.
 // Box passes (clamped edges) over an image of NC interleaved channels; three of each approximate a
 // Gaussian (`lightcraft_raster::blur::gaussian`). Each thread slides a running sum over CH pixels.
 // P: w, h, nc, r, ch. Bindings: src, dst.
@@ -6,12 +7,12 @@
 fn ld(i: u32, nc: u32) -> vec3<f32> {
     let j = i * nc;
     if (nc == 1u) {
-        return vec3<f32>(src[j], 0.0, 0.0);
+        return vec3<f32>(load_src(j), 0.0, 0.0);
     }
     if (nc == 2u) {
-        return vec3<f32>(src[j], src[j + 1u], 0.0);
+        return vec3<f32>(load_src(j), load_src(j + 1u), 0.0);
     }
-    return vec3<f32>(src[j], src[j + 1u], src[j + 2u]);
+    return vec3<f32>(load_src(j), load_src(j + 1u), load_src(j + 2u));
 }
 
 fn st(i: u32, nc: u32, v: vec3<f32>) {

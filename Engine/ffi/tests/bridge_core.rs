@@ -5,7 +5,11 @@ use unveil_ffi::*;
 
 #[test]
 fn abi_version_matches_header() {
-    assert_eq!(uv_abi_version(), 6);
+    assert_eq!(uv_abi_version(), 7);
+    assert!(include_str!("../include/uv.h").contains("#define UV_ABI_VERSION 7"));
+    assert_eq!(std::mem::offset_of!(UVFrame, display_width), 80);
+    assert_eq!(std::mem::offset_of!(UVFrame, display_height), 84);
+    assert_eq!(std::mem::size_of::<UVFrame>(), 88);
 }
 
 #[test]

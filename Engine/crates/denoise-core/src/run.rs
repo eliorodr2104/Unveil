@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! Denoising a whole Bayer mosaic with a tile model: cut it into overlapping tiles, run the model on each, bring
 //! each tile's scale back to the input's, keep clipped highlights as they were, and blend the tiles together.
 //!
@@ -210,7 +211,7 @@ pub fn denoise_bayer(
             started.elapsed().as_secs_f64() * 1e3
         );
     }
-    Ok(Rgb32f { width, height, data: acc })
+    Ok(Rgb32f { width, height, data: acc.into() })
 }
 
 /// Bring a tile's output to the input's scale and keep clipped highlights as they were (in place).

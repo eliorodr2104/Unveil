@@ -98,7 +98,7 @@ fn main() {
                 let (w, h) = r.size;
                 let verdict = if pass { "PASS" } else { "FAIL" };
                 println!(
-                    "| {file} | {preset} | {w}x{h} | {:.4} | {:.4} | {:.4} | {verdict} |",
+                    "| {file} | {preset} | {w}x{h} | {:.9} | {:.9} | {:.9} | {verdict} |",
                     r.mean, r.p99, r.max
                 );
             }

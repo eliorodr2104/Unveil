@@ -1,3 +1,5 @@
+// Modified by the Unveil authors, 2026: exact resident planning and reduced display output; see Engine/CHANGES.md.
+// Modified by the Unveil authors, 2026: typed display output; see Engine/CHANGES.md.
 //! The LightCraft develop pipeline (CPU reference implementation).
 //!
 //! Input: a scene-referred, linear Rec.2020 source image (already EXIF-oriented) at any resolution
@@ -27,6 +29,7 @@ pub mod auto;
 pub mod colorops;
 pub mod cull;
 pub mod dust;
+mod facts;
 pub mod finish;
 pub mod geometry;
 pub mod local;
@@ -36,13 +39,16 @@ pub mod optics;
 pub mod output;
 pub mod profiles;
 pub mod redeye;
+mod source;
 pub mod spots;
 pub mod tone;
 pub mod transform;
 pub mod upright;
 pub mod visualize;
 
+pub use facts::{NeedsPixels, PlanningFacts, plan_with_facts};
 pub use output::{DeepImage, DeepSamples, OutputDepth, OutputSpace, OutputTrc, Proof};
+pub use source::{SourceExtent, SourceId};
 pub use visualize::{MaskView, Overlay};
 
 use lightcraft_develop::{DevelopSettings, Treatment};
@@ -108,12 +114,22 @@ pub enum Quality {
     Full,
 }
 
+/// Density of the encoded 8-bit display output. High-depth exports always remain native.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RasterScale {
+    #[default]
+    Native,
+    Half,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RenderRequest {
     /// Output must fit in `max_w × max_h` (aspect preserved).
     pub max_w: usize,
     pub max_h: usize,
     pub quality: Quality,
+    /// Display density; U8 Half reduces encoded output after color. High-depth output stays native.
+    pub raster_scale: RasterScale,
     /// Show the crop frame's content only (true) or the whole uncropped image (crop tool active).
     pub apply_crop: bool,
     /// A diagnostic view drawn over the result (e.g. Point Color's "visualize range").
@@ -157,6 +173,7 @@ impl RenderRequest {
             max_w,
             max_h,
             quality: Quality::Full,
+            raster_scale: RasterScale::Native,
             apply_crop: true,
             overlay: Overlay::None,
             space: OutputSpace::Srgb,
@@ -167,9 +184,11 @@ impl RenderRequest {
     }
 }
 
-pub struct Rendered {
+pub struct Rendered<I = Rgba8> {
+    /// Logical coverage of the physical result; native renders use the image dimensions.
+    pub display_size: (usize, usize),
     /// The result, 8-bit (for deep renders: `deep` reduced to 8 bits, display-encoded).
-    pub image: Rgba8,
+    pub image: I,
     pub histogram: Histogram,
     /// The high-bit-depth result when [`RenderRequest::depth`] asks for one.
     pub deep: Option<DeepImage>,
@@ -223,22 +242,22 @@ pub fn frame_for(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, apply_cro
 /// buffer, framing and output size; the white-balanced, retouched, denoised image by those plus
 /// white balance, spots and noise reduction; each spatial plane by that plus its own radius. So a
 /// tone or colour slider drag (or exposure) re-runs only the per-pixel stage, a clarity drag skips
-/// resampling and noise reduction, and so on. Holds the last few output sizes (a draft-size and a
-/// full-size render of the same view both stay warm).
+/// resampling and noise reduction, and so on. Holds two output sizes so the preview and its
+/// whole-photo histogram stay warm. Reduced display frames reuse the native stages.
+#[derive(Default)]
 pub struct StageCache {
     entries: Mutex<Vec<CacheEntry>>,
-    capacity: usize,
     /// Another renderer's per-view state (the GPU renderer keeps its device-resident stages here).
     ext: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
 }
 
-impl Default for StageCache {
-    fn default() -> Self {
-        StageCache { entries: Mutex::new(Vec::new()), capacity: 2, ext: Mutex::new(None) }
-    }
-}
-
 impl StageCache {
+    /// Release CPU stages and their source pins after successful device promotion.
+    /// The renderer's device extension remains valid.
+    pub fn clear_cpu(&self) {
+        self.lock().clear();
+    }
+
     /// Drop everything (e.g. when memory is needed).
     pub fn clear(&self) {
         self.lock().clear();
@@ -313,7 +332,7 @@ impl StageCache {
         let mut v = self.lock();
         v.retain(|o| !(o.geo == e.geo && Arc::ptr_eq(&o.src, &e.src)));
         v.push(e);
-        while v.len() > self.capacity {
+        while v.len() > 2 {
             v.remove(0);
         }
     }
@@ -337,6 +356,8 @@ fn hash_of(parts: impl std::hash::Hash) -> u64 {
 /// applied), the geometric frame, the output size and the stage-cache keys. Shared by the CPU
 /// renderer and the GPU renderer (`lightcraft-gpu`), so both key their caches identically.
 pub struct Plan<'a> {
+    /// Logical delivery region before temporary source-neighborhood expansion.
+    pub display_size: (usize, usize),
     pub settings: Cow<'a, DevelopSettings>,
     pub frame: geometry::Frame,
     pub w: usize,
@@ -366,34 +387,54 @@ const AIRLIGHT_PROXY_EDGE: usize = 384;
 
 /// Resolve `s` against `src` for `req` (see [`Plan`]).
 pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &RenderRequest) -> Plan<'a> {
+    match plan_using(&mut facts::PixelFacts(src), info, s, req) {
+        Ok(plan) => plan,
+        Err(never) => match never {},
+    }
+}
+
+/// Both ownership modes resolve exactly the same framing, stages and cache keys.
+pub(crate) fn plan_using<'a, S: facts::FactSource>(
+    source: &mut S,
+    info: &SourceInfo,
+    s: &'a DevelopSettings,
+    req: &RenderRequest,
+) -> Result<Plan<'a>, S::Error> {
     let mut settings: Cow<'a, DevelopSettings> = match profiles::effective(s) {
-        Cow::Borrowed(b) => upright::resolve(src, info, b),
-        Cow::Owned(o) => Cow::Owned(upright::resolve(src, info, &o).into_owned()),
+        Cow::Borrowed(b) => source.resolve(info, b)?,
+        Cow::Owned(o) => Cow::Owned(source.resolve(info, &o)?.into_owned()),
     };
     visualize::adjust_settings(req.overlay, &mut settings);
     // a window must not choose a spot's source from the pixels it happens to hold: fix them
     // from a fixed-size render of the whole frame first
     if req.window.is_some() && settings.spots.iter().any(|sp| sp.source_offset.is_none()) {
-        let picked: Vec<Option<lightcraft_geom::Point>> =
-            settings.spots.iter().map(|sp| sp.source_offset.or_else(|| spots::pick_source(src, info, &settings, sp, None))).collect();
+        let mut picked = Vec::with_capacity(settings.spots.len());
+        for spot in &settings.spots {
+            picked.push(match spot.source_offset {
+                Some(offset) => Some(offset),
+                None => source.spot(info, &settings, spot)?,
+            });
+        }
         for (sp, o) in settings.to_mut().spots.iter_mut().zip(picked) {
             sp.source_offset = o;
         }
     }
     let s = &*settings;
-    let frame = frame_for(src, info, s, req.apply_crop);
+    let frame = source.frame(info, s, req.apply_crop)?;
     let (full_w, full_h) = frame.fit(req.max_w, req.max_h);
     // sizes and scale are those of the whole output; a window only narrows what is drawn
     let px_per_long = frame.px_per_long(full_w);
     let mut fixed_air = None;
     let mut keep = None;
+    let mut display_size = (full_w, full_h);
     let (frame, w, h) = match req.window {
         Some(win) => {
             let win = win.clamped(full_w, full_h);
+            display_size = (win.w, win.h);
             if s.section_enabled("effects") && (s.effects.dehaze != 0.0 || s.masks.iter().any(|m| m.adjust.dehaze != 0.0)) {
                 let k = (AIRLIGHT_PROXY_EDGE as f64 / full_w.max(full_h) as f64).min(1.0);
                 let (pw, ph) = (((full_w as f64 * k).round() as usize).max(1), ((full_h as f64 * k).round() as usize).max(1));
-                fixed_air = Some(local::frame_airlight(src, info, s, &frame, pw, ph));
+                fixed_air = Some(source.airlight(info, s, &frame, pw, ph)?);
             }
             // (spots grow the rendered window; only 8-bit renders are cut back to the request)
             let work = if req.depth == OutputDepth::U8 { spots::window_for_reads(s, &frame, full_w, full_h, px_per_long, win) } else { win };
@@ -404,10 +445,11 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         }
         None => (frame, full_w, full_h),
     };
-    let src_long = src.width.max(src.height);
+    let extent = source.extent();
+    let src_long = extent.width.max(extent.height);
     let geo = hash_of((format!("{frame:?}"), w, h));
     let (wb_t, wb_tint) = local::effective_wb(info, s);
-    let eyes = redeye::resolve(src, &s.red_eye, s.orientation, &frame, w, h, px_per_long);
+    let eyes = source.eyes(&s.red_eye, s, &frame, w, h, px_per_long)?;
     let d = &s.detail;
     let lin_key = hash_of((
         geo,
@@ -419,7 +461,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         [d.nr_luminance, d.nr_detail, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits),
         src_long,
     ));
-    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, eyes, fixed_air, keep, mattes: info.mattes.clone() }
+    Ok(Plan { display_size, settings, frame, w, h, px_per_long, src_long, geo, lin_key, eyes, fixed_air, keep, mattes: info.mattes.clone() })
 }
 
 /// Whether the scene-linear stage needs work only the CPU does (defringe, spot removal).
@@ -514,7 +556,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         let image = deep.to_rgba8();
         let histogram = Histogram::of_srgb8(&image);
         lap("finish (deep)", &mut t);
-        return Rendered { image, histogram, deep: Some(deep) };
+        return Rendered { display_size: plan.display_size, image, histogram, deep: Some(deep) };
     }
     let image = finish::finish(&prep, s, frame, info, req.space, req.proof);
     lap("finish", &mut t);
@@ -522,16 +564,50 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         Some(k) => i.crop(k.x, k.y, k.w, k.h),
         None => i.clone(),
     };
-    let histogram = match plan.keep {
-        Some(_) => Histogram::of_srgb8(&cut(&image)),
-        None => Histogram::of_srgb8(&image),
+    let histogram = if post_color_half(req) {
+        Histogram::of_srgb8(&reduce_display_half(&cut(&image)))
+    } else {
+        match plan.keep {
+            Some(_) => Histogram::of_srgb8(&cut(&image)),
+            None => Histogram::of_srgb8(&image),
+        }
     };
     lap("histogram", &mut t);
     let mut image = image;
     let mask = overlay_alpha(req.overlay, &plan, &prep);
     visualize::apply(&mut image, req.overlay, &plan, mask.as_ref());
     let image = if plan.keep.is_some() { cut(&image) } else { image };
-    Rendered { image, histogram, deep: None }
+    let image = if post_color_half(req) { reduce_display_half(&image) } else { image };
+    Rendered { display_size: plan.display_size, image, histogram, deep: None }
+}
+
+/// Reduced display requests preserve native processing and halve only the encoded output.
+pub fn post_color_half(req: &RenderRequest) -> bool {
+    req.raster_scale == RasterScale::Half && req.depth == OutputDepth::U8
+}
+
+/// Exact area coverage of encoded RGBA8 pixels, with one final round to the display byte.
+pub fn reduce_display_half(image: &Rgba8) -> Rgba8 {
+    let (w, h) = (image.width.div_ceil(2), image.height.div_ceil(2));
+    let mut output = Rgba8::new(w, h);
+    for y in 0..h {
+        let (y0, y1) = (y * image.height, (y + 1) * image.height);
+        for x in 0..w {
+            let (x0, x1) = (x * image.width, (x + 1) * image.width);
+            let mut rgb = [0.0f64; 3];
+            for sy in y0 / h..y1.div_ceil(h) {
+                let wy = (y1.min((sy + 1) * h) - y0.max(sy * h)) as f64 / image.height as f64;
+                for sx in x0 / w..x1.div_ceil(w) {
+                    let wx = (x1.min((sx + 1) * w) - x0.max(sx * w)) as f64 / image.width as f64;
+                    for c in 0..3 {
+                        rgb[c] += image.data[sy * image.width + sx][c] as f64 * wx * wy;
+                    }
+                }
+            }
+            output.data[y * w + x] = [rgb[0].round() as u8, rgb[1].round() as u8, rgb[2].round() as u8, 255];
+        }
+    }
+    output
 }
 
 /// The colour a colour-range mask would sample at normalized image point `p` (OkLab of the

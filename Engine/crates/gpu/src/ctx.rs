@@ -1,4 +1,4 @@
-// Modified by the Unveil authors, 2026: Gpu::upload reuses pooled buffers; see Engine/CHANGES.md.
+// Modified by the Unveil authors, 2026: pooled uploads and bounded original/mapped readback; see Engine/CHANGES.md.
 //! The wgpu device, the compiled kernels, buffers, dispatch and readback.
 
 use std::collections::HashMap;
@@ -14,32 +14,47 @@ struct Module {
     entries: &'static [&'static str],
 }
 
+const FINISH_BINDINGS: &[(&str, bool, &str)] = &[
+    ("img", false, "float_storage"),
+    ("log_l", false, "float_storage"),
+    ("base_p", false, "float_storage"),
+    ("clar", false, "float_storage"),
+    ("tex", false, "float_storage"),
+    ("dark", false, "float_storage"),
+    ("masks", false, "f32"),
+    ("aux", false, "f32"),
+    ("out", true, "u32"),
+];
+
 const MODULES: &[Module] = &[
     Module {
-        src: include_str!("wgsl/finish.wgsl"),
-        bindings: &[
-            ("img", false, "f32"),
-            ("log_l", false, "f32"),
-            ("base_p", false, "f32"),
-            ("clar", false, "f32"),
-            ("tex", false, "f32"),
-            ("dark", false, "f32"),
-            ("masks", false, "f32"),
-            ("aux", false, "f32"),
-            ("out", true, "u32"),
+        src: include_str!("wgsl/display_reduce.wgsl"),
+        bindings: &[("src", false, "u32"), ("dst", true, "u32"), ("bad", true, "atomic<u32>")],
+        #[cfg(not(test))]
+        entries: &["display_reduce_checked_stats"],
+        #[cfg(test)]
+        entries: &[
+            "display_reduce",
+            "display_reduce_checked",
+            "display_reduce_fast",
+            "display_reduce_checked_fast",
+            "display_reduce_checked_stats",
+            "display_validate",
         ],
-        entries: &["main"],
     },
-    Module { src: include_str!("wgsl/blur.wgsl"), bindings: &[("src", false, "f32"), ("dst", true, "f32")], entries: &["box_h", "box_v"] },
+    Module { src: include_str!("wgsl/finish.wgsl"), bindings: FINISH_BINDINGS, entries: &["main"] },
+    Module { src: include_str!("wgsl/finish.wgsl"), bindings: FINISH_BINDINGS, entries: &["main_unmasked"] },
+    Module { src: include_str!("wgsl/blur.wgsl"), bindings: &[("src", false, "float_storage"), ("dst", true, "f32")], entries: &["box_h", "box_v"] },
     Module {
         src: include_str!("wgsl/resize.wgsl"),
-        bindings: &[("src", false, "f32"), ("table", false, "u32"), ("dst", true, "f32")],
+        bindings: &[("src", false, "float_storage"), ("table", false, "u32"), ("dst", true, "f32")],
         entries: &["resize_h", "resize_v"],
     },
     Module {
         src: include_str!("wgsl/map.wgsl"),
-        bindings: &[("a", false, "f32"), ("b", false, "f32"), ("c", false, "f32"), ("dst", true, "f32")],
+        bindings: &[("a", false, "float_storage"), ("b", false, "f32"), ("c", false, "f32"), ("dst", true, "f32")],
         entries: &[
+            "expand_storage",
             "log_lum_k",
             "dark_k",
             "guided_pre",
@@ -58,12 +73,18 @@ const MODULES: &[Module] = &[
     },
     Module {
         src: include_str!("wgsl/mask.wgsl"),
-        bindings: &[("img", false, "f32"), ("log_l", false, "f32"), ("aux", false, "f32"), ("c", true, "f32"), ("alpha", true, "f32")],
+        bindings: &[
+            ("img", false, "float_storage"),
+            ("log_l", false, "float_storage"),
+            ("aux", false, "f32"),
+            ("c", true, "f32"),
+            ("alpha", true, "f32"),
+        ],
         entries: &["shape", "combine", "finalize"],
     },
     Module {
         src: include_str!("wgsl/geom.wgsl"),
-        bindings: &[("src", false, "f32"), ("dst", true, "f32"), ("coverage", false, "u32")],
+        bindings: &[("src", false, "float_storage"), ("dst", true, "f32"), ("coverage", false, "u32")],
         entries: &["orient", "sample_affine", "sample_warp"],
     },
 ];
@@ -83,6 +104,30 @@ struct Kernel {
 pub struct Buf {
     buf: Option<Tracked>,
     pub len: usize,
+    pub half_len: Option<usize>,
+}
+
+/// An owned, mapped staging buffer. Views borrow it only during `with_bytes`; dropping a stale
+/// render or unwinding a consumer releases its mapping without an extra CPU allocation.
+pub(crate) struct MappedReadback {
+    buffer: wgpu::Buffer,
+    size: u64,
+}
+
+impl MappedReadback {
+    pub(crate) fn with_bytes<R>(&self, consume: impl FnOnce(&[u8]) -> R) -> Result<R, String> {
+        if self.size == 0 {
+            return Ok(consume(&[]));
+        }
+        let view = self.buffer.slice(..self.size).get_mapped_range().map_err(|e| format!("mapped readback: {e:?}"))?;
+        Ok(consume(&view))
+    }
+}
+
+impl Drop for MappedReadback {
+    fn drop(&mut self) {
+        self.buffer.unmap();
+    }
 }
 
 impl Buf {
@@ -178,12 +223,14 @@ pub(crate) struct Tracked(wgpu::Buffer);
 impl Tracked {
     fn new(b: wgpu::Buffer) -> Tracked {
         ALLOCATED.fetch_add(b.size(), Ordering::Relaxed);
+        crate::pool_stats::record(b.size(), b.usage().bits(), crate::pool_stats::Operation::Allocate);
         Tracked(b)
     }
 }
 
 impl Drop for Tracked {
     fn drop(&mut self) {
+        crate::pool_stats::record(self.0.size(), self.0.usage().bits(), crate::pool_stats::Operation::Free);
         ALLOCATED.fetch_sub(self.0.size(), Ordering::Relaxed);
     }
 }
@@ -223,6 +270,7 @@ pub(crate) fn memory() -> GpuMemory {
 }
 
 pub struct Gpu {
+    pub generation: u64,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
@@ -232,6 +280,9 @@ pub struct Gpu {
     free: std::sync::Mutex<Vec<Tracked>>,
     /// Largest storage buffer the device accepts (bytes).
     pub max_buffer: u64,
+    pub half_storage: bool,
+    pub half_planes: bool,
+    pub half_source: bool,
 }
 
 /// WGSL constants shared by every module (generated from the CPU pipeline's values).
@@ -239,6 +290,7 @@ fn constants() -> String {
     use lightcraft_pipeline::finish::{GRAIN_HASH, MASK_SUMS, MASK_TERMS, SRGB_LUT_N};
     use lightcraft_pipeline::tone::{CHROMA_N, LUT_MAX_EV, LUT_MIN_EV, LUT_N};
     let mut s = String::new();
+    s += &format!("const REDUCTION_TILE: u32 = {}u;\n", crate::reduced_stats::TILE);
     let [to_lms, from_lms, to_lab, from_lab] = lightcraft_color::perceptual::oklab_matrices();
     for (name, m) in [("OK_TO_LMS", to_lms), ("OK_FROM_LMS", from_lms), ("OK_TO_LAB", to_lab), ("OK_FROM_LAB", from_lab)] {
         let rows: Vec<String> = m.iter().map(|r| format!("vec3<f32>({:?}, {:?}, {:?})", r[0], r[1], r[2])).collect();
@@ -268,19 +320,91 @@ fn constants() -> String {
     s
 }
 
-fn module_source(m: &Module, consts: &str) -> String {
-    let mut s = String::from(consts);
+/// Storage loads are fixed when the device is created; all shader arithmetic stays f32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageLoads {
+    Dynamic,
+    F32,
+}
+
+fn module_source(m: &Module, consts: &str, loads: StorageLoads) -> String {
+    let mut s = if m.bindings.iter().any(|(_, _, ty)| *ty == "f16") { String::from("enable f16;\n") } else { String::new() };
+    s += consts;
     s += "@group(0) @binding(0) var<storage, read> P: array<u32>;\n";
     for (i, (name, write, ty)) in m.bindings.iter().enumerate() {
         let access = if *write { "read_write" } else { "read" };
-        s += &format!("@group(0) @binding({}) var<storage, {access}> {name}: array<{ty}>;\n", i + 1);
+        let stored = if *ty != "float_storage" {
+            *ty
+        } else if loads == StorageLoads::F32 {
+            "f32"
+        } else {
+            "u32"
+        };
+        s += &format!("@group(0) @binding({}) var<storage, {access}> {name}: array<{stored}>;\n", i + 1);
+        if *ty == "float_storage" {
+            if loads == StorageLoads::F32 {
+                s += &format!("fn load_{name}(i: u32) -> f32 {{ return {name}[i]; }}\n");
+            } else {
+                s += &format!(
+                    "fn load_{name}(i: u32) -> f32 {{\n  if ((P[arrayLength(&P)-1u] & {}u) != 0u) {{ return unpack2x16float({name}[i/2u])[i%2u]; }}\n  return bitcast<f32>({name}[i]);\n}}\n",
+                    1u32 << i
+                );
+            }
+        }
     }
     s += include_str!("wgsl/common.wgsl");
-    s += m.src;
+    if m.entries == ["main_unmasked"] {
+        // Compile out the local-mask accumulator only when the host proves there are no terms.
+        // The generic kernel remains available for actual masks and optional compile failures.
+        s += &m.src.replace("fn main(", "fn main_unmasked(").replace("let nm = pu(F_NMASK);", "let nm = 0u;");
+    } else {
+        s += m.src;
+    }
     s
 }
 
+/// Contain optional compilation failures so initialization can retry the dynamic f32 loads.
+fn compile_module(
+    device: &wgpu::Device,
+    m: &Module,
+    consts: &str,
+    loads: StorageLoads,
+    inject_failure: bool,
+) -> Result<(wgpu::BindGroupLayout, Vec<wgpu::ComputePipeline>), String> {
+    let scopes =
+        [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Validation, wgpu::ErrorFilter::Internal].map(|filter| device.push_error_scope(filter));
+    let mut src = module_source(m, consts, loads);
+    if inject_failure {
+        src += "invalid optional storage shader";
+    }
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
+    let mut entries = vec![storage_entry(0, true)];
+    entries.extend(m.bindings.iter().enumerate().map(|(i, (_, w, _))| storage_entry(i as u32 + 1, !w)));
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+    let pipelines = m
+        .entries
+        .iter()
+        .map(|e| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(e),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some(e),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        })
+        .collect();
+    let errors: Vec<_> = scopes.into_iter().rev().filter_map(|scope| pollster::block_on(scope.pop())).collect();
+    if errors.is_empty() { Ok((layout, pipelines)) } else { Err(format!("{errors:?}")) }
+}
+
 impl Gpu {
+    pub fn finish_kernel(&self, no_masks: bool) -> &'static str {
+        if no_masks && self.kernels.contains_key("main_unmasked") { "main_unmasked" } else { "main" }
+    }
+
     /// Create a device on the best available adapter (no software fallback), or why there is none.
     pub fn new(backends: wgpu::Backends) -> Result<Gpu, String> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -306,9 +430,14 @@ impl Gpu {
             limits.max_buffer_size = limits.max_buffer_size.min(buffer);
             log::info!("gpu: LIGHTCRAFT_GPU_LIMITS: storage bindings ≤ {} MiB, buffers ≤ {} MiB", binding >> 20, buffer >> 20);
         }
+        let mode = std::env::var("UNVEIL_E2_HALF").unwrap_or_default();
+        let half_requested = matches!(mode.as_str(), "lin" | "all" | "source")
+            && adapter.features().contains(wgpu::Features::SHADER_F16)
+            && std::env::var_os("UNVEIL_E2_NO_F16").is_none();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("lightcraft"),
             required_limits: limits.clone(),
+            required_features: if half_requested { wgpu::Features::SHADER_F16 } else { wgpu::Features::empty() },
             ..Default::default()
         }))
         .map_err(|e| format!("{}: device creation failed ({e})", info.name))?;
@@ -323,35 +452,46 @@ impl Gpu {
             log::error!("gpu: device lost ({reason:?}): {msg}");
             crate::mark_broken(&format!("device lost ({reason:?}): {msg}"));
         });
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let consts = constants();
         let mut kernels = HashMap::new();
-        for m in MODULES {
-            let src = module_source(m, &consts);
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
-            let mut entries = vec![storage_entry(0, true)];
-            entries.extend(m.bindings.iter().enumerate().map(|(i, (_, w, _))| storage_entry(i as u32 + 1, !w)));
-            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-            for e in m.entries {
-                let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(e),
-                    layout: Some(&pl),
-                    module: &module,
-                    entry_point: Some(e),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-                kernels.insert(*e, Kernel { pipeline, layout: layout.clone(), nbuf: m.bindings.len() });
+        // Resolve optional packing before choosing the storage loads for every base kernel.
+        let mut half_storage = false;
+        if half_requested {
+            let module = Module {
+                src: include_str!("wgsl/storage.wgsl"),
+                bindings: &[("src", false, "f32"), ("dst", true, "f16"), ("bad", true, "atomic<u32>")],
+                entries: &["pack_half"],
+            };
+            if let Ok((layout, mut pipelines)) =
+                compile_module(&device, &module, &consts, StorageLoads::Dynamic, std::env::var_os("UNVEIL_E2_FAIL_HALF").is_some())
+            {
+                let Some(pipeline) = pipelines.pop() else { return Err("pack_half pipeline missing".into()) };
+                kernels.insert("pack_half", Kernel { pipeline, layout, nbuf: 3 });
+                half_storage = true;
             }
         }
-        if let Some(e) = pollster::block_on(scope.pop()) {
-            log::error!("gpu: kernels failed to build on {}: {e}", info.name);
-            return Err(format!("{}: kernels failed to build ({e})", info.name));
+        let fail_f32 = std::env::var_os("UNVEIL_E2_FAIL_F32_BASE").is_some();
+        for m in MODULES {
+            // A half-enabled device can hold packed and exact-retry sources together. Its
+            // dynamic loads handle both; direct f32 loads are safe only without half storage.
+            let loads =
+                if !half_storage && m.bindings.iter().any(|(_, _, ty)| *ty == "float_storage") { StorageLoads::F32 } else { StorageLoads::Dynamic };
+            let optional = m.entries == ["main_unmasked"];
+            let fail_optional = optional && std::env::var_os("UNVEIL_E45_FAIL_UNMASKED").is_some();
+            let compiled = compile_module(&device, m, &consts, loads, fail_optional || fail_f32 && loads == StorageLoads::F32).or_else(|error| {
+                if loads == StorageLoads::F32 { compile_module(&device, m, &consts, StorageLoads::Dynamic, fail_optional) } else { Err(error) }
+            });
+            let (layout, pipelines) = match compiled {
+                Ok(compiled) => compiled,
+                Err(error) if optional => {
+                    log::warn!("gpu: unmasked finish unavailable, keeping the generic kernel: {error}");
+                    continue;
+                }
+                Err(error) => return Err(format!("{}: kernels failed to build ({error})", info.name)),
+            };
+            for (entry, pipeline) in m.entries.iter().zip(pipelines) {
+                kernels.insert(*entry, Kernel { pipeline, layout: layout.clone(), nbuf: m.bindings.len() });
+            }
         }
         let dummy = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dummy"),
@@ -361,7 +501,20 @@ impl Gpu {
         });
         let max_buffer = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
         log::info!("gpu: {} ({:?}), buffers ≤ {} MiB", info.name, info.backend, max_buffer >> 20);
-        Ok(Gpu { device, queue, info, kernels, dummy, free: Default::default(), max_buffer })
+        static GENERATION: AtomicU64 = AtomicU64::new(1);
+        Ok(Gpu {
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+            device,
+            queue,
+            info,
+            kernels,
+            dummy,
+            free: Default::default(),
+            max_buffer,
+            half_storage,
+            half_planes: half_storage && matches!(mode.as_str(), "all" | "source"),
+            half_source: half_storage && mode == "source",
+        })
     }
 
     /// A buffer of `len` 32-bit values with undefined contents (a recycled one when possible).
@@ -372,7 +525,7 @@ impl Gpu {
         let size = (len.max(1) * 4) as u64;
         if size > self.limit() {
             self.over_limit(size);
-            return Buf { buf: Some(Tracked::new(self.placeholder())), len };
+            return Buf { buf: Some(Tracked::new(self.placeholder())), len, half_len: None };
         }
         let recycled = {
             let mut f = self.free.lock().unwrap_or_else(|e| e.into_inner());
@@ -386,6 +539,7 @@ impl Gpu {
                 .map(|(i, _)| i)
                 .map(|i| f.swap_remove(i));
             if let Some(b) = &b {
+                crate::pool_stats::record(b.0.size(), b.0.usage().bits(), crate::pool_stats::Operation::Reuse);
                 POOLED.fetch_sub(b.0.size(), Ordering::Relaxed);
             }
             b
@@ -398,7 +552,7 @@ impl Gpu {
                 mapped_at_creation: false,
             }))
         });
-        Buf { buf: Some(buf), len }
+        Buf { buf: Some(buf), len, half_len: None }
     }
 
     /// Submit command buffers, then make the buffers this thread dropped before reusable.
@@ -415,6 +569,7 @@ impl Gpu {
             let mut f = self.free.lock().unwrap_or_else(|e| e.into_inner());
             for b in bufs {
                 POOLED.fetch_add(b.0.size(), Ordering::Relaxed);
+                crate::pool_stats::record(b.0.size(), b.0.usage().bits(), crate::pool_stats::Operation::Return);
                 f.push(b);
                 added = true;
             }
@@ -427,6 +582,7 @@ impl Gpu {
     /// Free pooled buffers (oldest first) until at most `keep` bytes stay pooled.
     pub fn trim(&self, keep: u64) {
         let mut f = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = keep.min(POOL_LIMIT.load(Ordering::Relaxed));
         let mut total: u64 = f.iter().map(|b| b.0.size()).sum();
         let mut dropped = Vec::new();
         while total > keep && !f.is_empty() {
@@ -456,7 +612,7 @@ impl Gpu {
         }
         if bytes.len() as u64 > self.limit() {
             self.over_limit(bytes.len() as u64);
-            return Buf { buf: Some(Tracked::new(self.placeholder())), len };
+            return Buf { buf: Some(Tracked::new(self.placeholder())), len, half_len: None };
         }
         // large uploads (the source) keep a fresh buffer: writing a recycled one needs a staging copy as big
         if bytes.len() < SMALL_UPLOAD && bytes.len().is_multiple_of(4) {
@@ -469,7 +625,7 @@ impl Gpu {
             contents: bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         });
-        Buf { buf: Some(Tracked::new(buf)), len }
+        Buf { buf: Some(Tracked::new(buf)), len, half_len: None }
     }
 
     fn over_limit(&self, size: u64) {
@@ -515,9 +671,12 @@ impl Gpu {
             return;
         };
         assert_eq!(bufs.len(), k.nbuf, "{name}: binding count");
+        let mut p = p.to_vec();
+        let formats = bufs.iter().enumerate().fold(0u32, |bits, (i, b)| bits | if b.is_some_and(|b| b.half_len.is_some()) { 1 << i } else { 0 });
+        p.push(formats);
         let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(if p.is_empty() { &[0u32] } else { p }),
+            contents: bytemuck::cast_slice(&p),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() }];
@@ -537,29 +696,98 @@ impl Gpu {
     /// A failed readback (device lost, map error, timeout) fails the render ([`FailKind::Fatal`])
     /// and returns zeros, which the caller discards; after an earlier failure in the same render
     /// nothing more is submitted.
-    pub fn finish_and_read<T: bytemuck::Pod>(&self, mut enc: wgpu::CommandEncoder, src: &Buf, len: usize) -> Vec<T> {
-        assert!(len <= src.len, "readback of {len} values from a buffer of {}", src.len);
-        let zeros = || vec![<T as bytemuck::Zeroable>::zeroed(); len];
-        if failed() {
-            return zeros();
+    pub fn finish_and_read<T: bytemuck::Pod>(&self, enc: wgpu::CommandEncoder, src: &Buf, len: usize) -> Vec<T> {
+        self.with_mapped_readback(enc, src, len, |bytes| bytemuck::cast_slice(bytes).to_vec())
+            .unwrap_or_else(|| vec![<T as bytemuck::Zeroable>::zeroed(); len])
+    }
+
+    /// read_original_into copies immutable source bytes through one reusable staging allocation.
+    /// The destination is private to the caller until every chunk succeeds. No failed map can
+    /// escape as zeros, and each BufferView drops before its staging storage is unmapped/reused.
+    pub(crate) fn read_original_into(&self, src: &Buf, destination: &mut [u8], allowed: impl Fn(usize) -> Result<(), String>) -> Result<(), String> {
+        const CHUNK: usize = 16 << 20;
+        if destination.is_empty() || destination.len() != src.len.checked_mul(4).ok_or("source byte count overflow")? {
+            return Err("original readback length does not match its source".into());
         }
-        let size = (len * 4) as u64;
+        allowed(0)?;
+        let staging = Tracked::new(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("original readback chunk"),
+            size: destination.len().min(CHUNK) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        for (index, bytes) in destination.chunks_mut(CHUNK).enumerate() {
+            allowed(index)?;
+            let mut enc = self.encoder();
+            enc.copy_buffer_to_buffer(src.raw(), (index * CHUNK) as u64, &staging.0, 0, bytes.len() as u64);
+            self.submit([enc.finish()]);
+            let slice = staging.0.slice(..bytes.len() as u64);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            let result: Result<(), String> = (|| {
+                self.device
+                    .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(READBACK_TIMEOUT) })
+                    .map_err(|e| format!("original readback wait failed: {e}"))?;
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|e| format!("original readback callback failed: {e}"))?
+                    .map_err(|e| format!("original readback map failed: {e}"))?;
+                let mapped = slice.get_mapped_range().map_err(|e| format!("original readback view failed: {e:?}"))?;
+                bytes.copy_from_slice(&mapped);
+                Ok(())
+            })();
+            staging.0.unmap();
+            if let Err(reason) = result {
+                fail(FailKind::Fatal, reason.clone());
+                return Err(reason);
+            }
+            allowed(index + 1)?;
+        }
+        Ok(())
+    }
+
+    /// Consume mapped GPU output without an intermediate owned image. `len` counts 32-bit words.
+    /// The callback runs only after a successful readback and cannot retain the mapped bytes.
+    pub fn with_mapped_readback<R>(&self, enc: wgpu::CommandEncoder, src: &Buf, len: usize, consume: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        match self.finish_and_map(enc, src, len)?.with_bytes(consume) {
+            Ok(value) => Some(value),
+            Err(reason) => {
+                fail(FailKind::Fatal, reason);
+                None
+            }
+        }
+    }
+
+    /// Submit and retain mapped staging storage for delivery on another thread.
+    pub(crate) fn finish_and_map(&self, enc: wgpu::CommandEncoder, src: &Buf, len: usize) -> Option<MappedReadback> {
+        self.finish_and_map_padded(enc, src, len, 0)
+    }
+
+    /// A cropped strided view may expose padding after its last row. Reserve that small tail so
+    /// consumers can safely borrow `height * stride` bytes, as the frame ABI promises.
+    pub(crate) fn finish_and_map_padded(&self, mut enc: wgpu::CommandEncoder, src: &Buf, len: usize, tail: usize) -> Option<MappedReadback> {
+        assert!(len <= src.len, "readback of {len} values from a buffer of {}", src.len);
+        if failed() {
+            return None;
+        }
+        let size = ((len + tail) * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: size.max(4),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        enc.copy_buffer_to_buffer(src.raw(), 0, &staging, 0, size);
+        enc.copy_buffer_to_buffer(src.raw(), 0, &staging, 0, (len * 4) as u64);
         self.submit([enc.finish()]);
-        let slice = staging.slice(..size);
+        let slice = staging.slice(..size.max(4));
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
         let failed = |why: String| {
             fail(FailKind::Fatal, format!("readback failed: {why}"));
-            zeros()
+            None
         };
         // A lost device makes the wait fail and the map callback never run: checking both keeps
         // this from blocking forever (or handing back an unwritten buffer as the image).
@@ -572,14 +800,7 @@ impl Gpu {
             Ok(Err(e)) => return failed(format!("{e}")),
             Err(e) => return failed(format!("map callback: {e}")),
         }
-        let data = match slice.get_mapped_range() {
-            Ok(d) => d,
-            Err(e) => return failed(format!("{e:?}")),
-        };
-        let out: Vec<T> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-        staging.unmap();
-        out
+        Some(MappedReadback { buffer: staging, size })
     }
 }
 
@@ -613,6 +834,7 @@ fn parse_limits(v: &str) -> Option<(u64, u64)> {
 /// How a GPU render failed (it is then redone on the CPU).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FailKind {
+    Precision,
     /// A buffer over the device limits: this render only.
     Limit,
     /// The device ran out of memory: this render only (the buffer pool is emptied).
@@ -728,6 +950,87 @@ pub fn groups1(n: usize) -> [u32; 3] {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "requires a fresh process with UNVEIL_E45_FAIL_UNMASKED=1"]
+    fn optional_unmasked_compile_failure_keeps_the_generic_gpu() {
+        assert_eq!(std::env::var("UNVEIL_E45_FAIL_UNMASKED").as_deref(), Ok("1"));
+        let gpu = super::Gpu::new(wgpu::Backends::METAL).expect("optional kernel must not disable the GPU");
+        assert!(!gpu.kernels.contains_key("main_unmasked"), "injected compile failure must be observed");
+        assert!(gpu.kernels.contains_key("main"));
+        assert_eq!(gpu.finish_kernel(true), "main");
+    }
+
+    #[test]
+    fn a_panicking_consumer_releases_its_view_and_dropping_the_owner_unmaps() {
+        let Ok(gpu) = super::Gpu::new(wgpu::Backends::PRIMARY) else {
+            eprintln!("skipped: no GPU adapter for mapped lifetime");
+            return;
+        };
+        let source = gpu.upload(&[7u32, 11, 13]);
+        let mapped = gpu.finish_and_map(gpu.encoder(), &source, 3).unwrap();
+        let buffer = mapped.buffer.clone();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mapped.with_bytes(|_| panic!("consumer panic")).unwrap();
+        }));
+        assert!(panic.is_err());
+        assert_eq!(mapped.with_bytes(|bytes| bytemuck::cast_slice::<u8, u32>(bytes).to_vec()).unwrap(), [7, 11, 13]);
+        drop(mapped);
+        assert!(buffer.slice(..12).get_mapped_range().is_err(), "stale-result drop must unmap the retained buffer");
+    }
+
+    #[test]
+    fn mapped_readback_writes_padded_rows_without_an_intermediate_image() {
+        let Ok(gpu) = super::Gpu::new(wgpu::Backends::PRIMARY) else {
+            eprintln!("skipped: no GPU adapter for mapped readback");
+            return;
+        };
+        eprintln!("mapped readback adapter: {}", gpu.info.name);
+        let pixels: Vec<[u8; 4]> = (0u8..35).map(|n| [n, n.wrapping_mul(7), 255 - n, 255]).collect();
+        let source = gpu.upload(&pixels);
+        let mut destination = vec![0xA5u8; 5 * 64];
+        let histogram = gpu.with_mapped_readback(gpu.encoder(), &source, pixels.len(), |bytes| {
+            let mapped: &[[u8; 4]] = bytemuck::cast_slice(bytes);
+            for y in 0..5 {
+                destination[y * 64..y * 64 + 28].copy_from_slice(bytemuck::cast_slice(&mapped[y * 7..(y + 1) * 7]));
+            }
+            lightcraft_raster::Histogram::of_srgb8_view(7, 5, |x, y| mapped[y * 7 + x])
+        });
+        let owned = lightcraft_raster::Rgba8 { width: 7, height: 5, data: lightcraft_raster::Buffer::Heap(pixels.clone()) };
+        assert_eq!(histogram, Some(lightcraft_raster::Histogram::of_srgb8(&owned)));
+        for y in 0..5 {
+            assert_eq!(&destination[y * 64..y * 64 + 28], bytemuck::cast_slice::<[u8; 4], u8>(&pixels[y * 7..(y + 1) * 7]));
+            assert!(destination[y * 64 + 28..(y + 1) * 64].iter().all(|byte| *byte == 0xA5));
+        }
+        let second: Vec<[u8; 4]> = gpu.finish_and_read(gpu.encoder(), &source, pixels.len());
+        assert_eq!(second, pixels, "borrowed consumption must not change the GPU source or owned readback");
+    }
+
+    #[test]
+    fn trimming_free_buffers_cannot_recycle_an_unsubmitted_source() {
+        let gpu = crate::device().expect("actual GPU required");
+        crate::set_pool_limit(64 << 20);
+        crate::trim_reusable(0);
+        let scope = super::RenderScope::new(gpu);
+        let source = gpu.upload(&[7u32, 11, 13, 17]);
+        let output = gpu.buffer(4);
+        let mut encoder = gpu.encoder();
+        encoder.copy_buffer_to_buffer(source.raw(), 0, output.raw(), 0, 16);
+        drop(source);
+        let retired = crate::memory().retired;
+        assert!(retired >= 16);
+        crate::trim_reusable(0);
+        assert_eq!(crate::memory().retired, retired);
+        let other = gpu.upload(&[99u32, 99, 99, 99]);
+        gpu.submit([encoder.finish()]);
+        let result: Vec<u32> = gpu.finish_and_read(gpu.encoder(), &output, 4);
+        assert_eq!(result, [7, 11, 13, 17]);
+        drop((other, output));
+        drop(scope);
+        assert_eq!(crate::memory().retired, 0);
+        crate::trim_reusable(0);
+        crate::set_pool_limit(256 << 20);
+    }
+
+    #[test]
     fn limits_override_parses() {
         assert_eq!(super::parse_limits("webgpu"), Some((128 << 20, 256 << 20)));
         assert_eq!(super::parse_limits(" Downlevel "), Some((128 << 20, 256 << 20)));
@@ -744,3 +1047,7 @@ mod tests {
         assert!(super::groups2(16384, 16384, [16, 16]).iter().all(|g| *g <= 65535));
     }
 }
+
+#[cfg(test)]
+#[path = "base_format_tests.rs"]
+mod base_format_tests;

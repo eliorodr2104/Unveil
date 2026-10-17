@@ -35,13 +35,14 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// LOAD_LOG_CAP bounds the load log: the newest events win, so a forgotten switch never grows memory.
 const LOAD_LOG_CAP: usize = 512;
 
-fn is_enabled() -> bool {
+pub(crate) fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
 /// set_enabled turns the diagnostics on or off; turning them off empties the load log.
 pub(crate) fn set_enabled(enabled: bool) -> Value {
     ENABLED.store(enabled, Ordering::Relaxed);
+    lightcraft_gpu::set_pool_diagnostics(enabled);
     if !enabled {
         lock(&LOADS).clear();
     }
@@ -59,17 +60,9 @@ pub(crate) struct Span {
 impl Span {
     pub fn start() -> Span {
         if !is_enabled() {
-            return Span {
-                start_ns: 0,
-                cpu_ns: 0,
-                active: false,
-            };
+            return Span { start_ns: 0, cpu_ns: 0, active: false };
         }
-        Span {
-            start_ns: uptime_ns(),
-            cpu_ns: thread_cpu_ns(),
-            active: true,
-        }
+        Span { start_ns: uptime_ns(), cpu_ns: thread_cpu_ns(), active: true }
     }
 
     fn finish(&self) -> (u64, u64) {
@@ -135,9 +128,7 @@ pub(crate) fn instrument_loads(session: &mut Session) {
         session.media.file_loader = Some(Arc::new(move |path: &str, max_edge: usize| {
             let span = Span::start();
             let result = inner(path, max_edge);
-            let size = result
-                .as_ref()
-                .map_or((0, 0), |(image, _)| (image.width, image.height));
+            let size = result.as_ref().map_or((0, 0), |(image, _)| (image.width, image.height));
             log_load("decode", path, max_edge, size, &span, result.is_ok());
             result
         }));
@@ -154,9 +145,7 @@ pub(crate) fn instrument_loads(session: &mut Session) {
         session.media.preview_loader = Some(Arc::new(move |path: &str, max_edge: usize| {
             let span = Span::start();
             let result = inner(path, max_edge);
-            let size = result
-                .as_ref()
-                .map_or((0, 0), |image| (image.width, image.height));
+            let size = result.as_ref().map_or((0, 0), |image| (image.width, image.height));
             log_load("embedded", path, max_edge, size, &span, result.is_some());
             result
         }));
@@ -205,6 +194,16 @@ struct Stats {
     render: [Stat; 4],
     histogram: [Stat; 4],
     deliver: [Stat; 4],
+    output: [OutputStat; 4],
+}
+
+#[derive(Clone, Copy, Default)]
+struct OutputStat {
+    mapped: u64,
+    owned: u64,
+    mapped_pixel_bytes: u64,
+    physical_pixels: u64,
+    display_pixels: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -215,22 +214,36 @@ pub(crate) enum Part {
 }
 
 static STATS: Mutex<Stats> = Mutex::new(Stats {
-    render: [Stat {
-        count: 0,
-        wall_ns: 0,
-        cpu_ns: 0,
-    }; 4],
-    histogram: [Stat {
-        count: 0,
-        wall_ns: 0,
-        cpu_ns: 0,
-    }; 4],
-    deliver: [Stat {
-        count: 0,
-        wall_ns: 0,
-        cpu_ns: 0,
-    }; 4],
+    output: [OutputStat { mapped: 0, owned: 0, mapped_pixel_bytes: 0, physical_pixels: 0, display_pixels: 0 };
+        4],
+    render: [Stat { count: 0, wall_ns: 0, cpu_ns: 0 }; 4],
+    histogram: [Stat { count: 0, wall_ns: 0, cpu_ns: 0 }; 4],
+    deliver: [Stat { count: 0, wall_ns: 0, cpu_ns: 0 }; 4],
 });
+
+/// record_output counts successful render results before delivery or stale-result rejection.
+/// Mapped pixel bytes measure payload that avoided an intermediate CPU image, not live memory.
+pub(crate) fn record_output(
+    category: Category,
+    mapped: bool,
+    physical: (usize, usize),
+    display: (usize, usize),
+) {
+    if !is_enabled() {
+        return;
+    }
+    let mut stats = lock(&STATS);
+    let stat = &mut stats.output[category.0];
+    let pixels = physical.0 * physical.1;
+    stat.physical_pixels += pixels as u64;
+    stat.display_pixels += (display.0 * display.1) as u64;
+    if mapped {
+        stat.mapped += 1;
+        stat.mapped_pixel_bytes += (pixels * 4) as u64;
+    } else {
+        stat.owned += 1;
+    }
+}
 
 /// record adds a finished span to the totals of its category and part.
 pub(crate) fn record(category: Category, part: Part, span: &Span) {
@@ -262,6 +275,10 @@ pub(crate) fn renders_json(reset: bool) -> Value {
     };
     let out = json!({
         "render": part(&stats.render), "histogram": part(&stats.histogram), "deliver": part(&stats.deliver),
+        "output": stats.output.iter().zip(CATEGORY_NAMES).map(|(s, name)| json!({
+            "category": name, "mapped": s.mapped, "owned": s.owned, "mappedPixelBytes": s.mapped_pixel_bytes,
+            "physicalPixels": s.physical_pixels, "displayPixels": s.display_pixels,
+        })).collect::<Vec<_>>(),
     });
     if reset {
         *stats = Stats::default();
@@ -286,10 +303,7 @@ mod tests {
 
     #[test]
     fn a_span_started_while_off_is_inert() {
-        assert!(
-            !is_enabled(),
-            "no other test of this binary enables the diagnostics"
-        );
+        assert!(!is_enabled(), "no other test of this binary enables the diagnostics");
         let span = Span::start();
         assert!(!span.active && span.start_ns == 0);
         record(Category::of(true, false), Part::Render, &span);

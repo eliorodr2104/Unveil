@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): observe highlight reconstruction scratch capacity.
 //! Clip-aware highlight handling on demosaiced camera RGB (before white balance, white level = 1.0).
 //!
 //! - [`clip_neutral`]: white-balance-aware clipping so that sensor-clipped areas render neutral instead of
@@ -27,8 +28,10 @@ fn fill_invalid(w: usize, h: usize, values: &mut [[f32; 3]], valid: &mut [bool])
     }
     // Build a pyramid of weighted means, fill each level from the next coarser one.
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let mut cv = vec![[0f32; 3]; cw * ch];
-    let mut cval = vec![false; cw * ch];
+    let mut cv = lightcraft_raster::Buffer::filled_returnable(cw * ch, [0f32; 3]);
+    let mut cval = lightcraft_raster::Buffer::filled_returnable(cw * ch, false);
+    let _chroma_memory = crate::memory_trace::Allocation::of("highlight-chroma", &cv);
+    let _valid_memory = crate::memory_trace::Allocation::of("highlight-valid", &cval);
     {
         let (values, valid) = (&*values, &*valid);
         downsample(w, h, &mut cv, &mut cval, |i| valid[i].then(|| values[i]));
@@ -123,8 +126,10 @@ pub fn reconstruct(img: &mut Rgb32f, wb: [f32; 3], clip: f32) -> usize {
     }
     // chromaticity (white-balanced ratios to the channel sum) of unclipped pixels, at half resolution
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let mut cv = vec![[1f32 / 3.0; 3]; cw * ch];
-    let mut cval = vec![false; cw * ch];
+    let mut cv = lightcraft_raster::Buffer::filled_returnable(cw * ch, [1f32 / 3.0; 3]);
+    let mut cval = lightcraft_raster::Buffer::filled_returnable(cw * ch, false);
+    let _chroma_memory = crate::memory_trace::Allocation::of("highlight-chroma", &cv);
+    let _valid_memory = crate::memory_trace::Allocation::of("highlight-valid", &cval);
     {
         let data = &img.data;
         downsample(w, h, &mut cv, &mut cval, |i| chroma_of(&data[i], wb, clip));

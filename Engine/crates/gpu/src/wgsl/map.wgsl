@@ -1,9 +1,10 @@
+// Modified by the Unveil authors, 2026: half storage with explicit f32 loads; see Engine/CHANGES.md.
 // Element-wise kernels (one thread per pixel, 1-D on a 2-D grid). Bindings: a, b, c (inputs), dst.
 // P[0] = pixel count; further parameters per kernel. Each mirrors a CPU expression in
 // `lightcraft_pipeline::local` (named in the comment).
 
 fn rgb_a(i: u32) -> vec3<f32> {
-    return vec3<f32>(a[3u * i], a[3u * i + 1u], a[3u * i + 2u]);
+    return vec3<f32>(load_a(3u * i), load_a(3u * i + 1u), load_a(3u * i + 2u));
 }
 
 fn put_rgb(i: u32, v: vec3<f32>) {
@@ -40,7 +41,7 @@ fn guided_pre(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
     if (i >= pu(0u)) {
         return;
     }
-    let p = a[i];
+    let p = load_a(i);
     dst[2u * i] = p;
     dst[2u * i + 1u] = p * p;
 }
@@ -52,8 +53,8 @@ fn guided_ab(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroup
     if (i >= pu(0u)) {
         return;
     }
-    let m = a[2u * i];
-    let c = a[2u * i + 1u];
+    let m = load_a(2u * i);
+    let c = load_a(2u * i + 1u);
     let v = max(c - m * m, 0.0);
     let k = v / (v + pf(1u));
     dst[2u * i] = k;
@@ -67,7 +68,7 @@ fn guided_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgr
     if (i >= pu(0u)) {
         return;
     }
-    dst[i] = b[2u * i] * a[i] + b[2u * i + 1u];
+    dst[i] = b[2u * i] * load_a(i) + b[2u * i + 1u];
 }
 
 // Cross guided filter (`masks::guided_cross`), a: guide, b: input. P[1] = 0: (guide, input);
@@ -78,7 +79,7 @@ fn xguided_pre(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgro
     if (i >= pu(0u)) {
         return;
     }
-    let gi = a[i];
+    let gi = load_a(i);
     let p = b[i];
     if (pu(1u) == 0u) {
         dst[2u * i] = gi;
@@ -97,8 +98,8 @@ fn xguided_ab(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgrou
     if (i >= pu(0u)) {
         return;
     }
-    let mi = a[2u * i];
-    let mp = a[2u * i + 1u];
+    let mi = load_a(2u * i);
+    let mp = load_a(2u * i + 1u);
     let v = max(b[2u * i + 1u] - mi * mi, 0.0);
     let k = (b[2u * i] - mi * mp) / (v + pf(1u));
     dst[2u * i] = k;
@@ -112,7 +113,7 @@ fn xguided_apply(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     if (i >= pu(0u)) {
         return;
     }
-    dst[i] = max(c[i], clamp(b[2u * i] * a[i] + b[2u * i + 1u], 0.0, 1.0));
+    dst[i] = max(c[i], clamp(b[2u * i] * load_a(i) + b[2u * i + 1u], 0.0, 1.0));
 }
 
 // White balance: 3×3 matrix (P[1] = has matrix, P[2..11] row-major), clamped at 0.
@@ -178,7 +179,7 @@ fn subsample(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroup
     if (i >= pu(0u)) {
         return;
     }
-    dst[i] = a[i * pu(1u)];
+    dst[i] = load_a(i * pu(1u));
 }
 
 // `redeye::eye_pixel` (a: image). P[1] = width, P[2] = eye count, then EYE_WORDS per eye:
@@ -225,4 +226,10 @@ fn redeye_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups
         }
     }
     put_rgb(i, c);
+}
+
+@compute @workgroup_size(256)
+fn expand_storage(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let i = lin_index(g, nw);
+    if (i < pu(0u)) { dst[i] = load_a(i); }
 }

@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: exact planning without a retained CPU original; see Engine/CHANGES.md.
 //! Scene-linear preparation: white balance + exposure, and the spatial planes the per-pixel stage
 //! needs (edge-aware base layer for highlights/shadows, clarity/texture bands, dehaze veil).
 
@@ -348,7 +349,12 @@ pub(crate) fn prepare(
 /// The airlight of the whole output frame, estimated on a small render of it (`proxy_w` px wide):
 /// a windowed render must dehaze with the frame's airlight, not that of the pixels it holds.
 pub(crate) fn frame_airlight(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame, proxy_w: usize, proxy_h: usize) -> f32 {
-    let mut img = frame.sample(src, proxy_w, proxy_h);
+    airlight_from_proxy(frame.sample(src, proxy_w, proxy_h), info, s, frame)
+}
+
+/// Apply current white balance to an exact unbalanced frame sample before estimating its airlight.
+pub(crate) fn airlight_from_proxy(mut img: Rgb32f, info: &SourceInfo, s: &DevelopSettings, frame: &Frame) -> f32 {
+    let proxy_w = img.width;
     white_balance(&mut img, info, s);
     let sigma = (0.02 * frame.px_per_long(proxy_w)).max(1.0) as f32;
     airlight(&gaussian(&img.map(dark_of), sigma))

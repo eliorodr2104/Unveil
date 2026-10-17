@@ -9,6 +9,8 @@ description = "LightCraft raster (L0)"
 workspace = true
 
 [dependencies]
+# Modified for Unveil (2026-10-17): typed returnable storage for selected RAW buffers.
+lightcraft-sysmem = { workspace = true }
 serde = { workspace = true }
 lightcraft-geom = { workspace = true }
 lightcraft-color = { workspace = true }

@@ -24,6 +24,8 @@ jxl-oxide = { workspace = true, optional = true }
 
 [features]
 default = ["jxl"]
+# Modified for Unveil (2026-10-14): opt-in decoder invocation counts for preparation validation.
+decode-counts = []
 ## JPEG XL compressed DNGs (DNG 1.7, compression 52546) via jxl-oxide (pure Rust, MIT OR Apache-2.0).
 jxl = ["dep:jxl-oxide"]
 

@@ -21,6 +21,7 @@ log = { workspace = true }
 
 [dev-dependencies]
 png = { workspace = true }
+jpeg-encoder = { workspace = true }
 dhat = { workspace = true }
 
 [lints.rust]

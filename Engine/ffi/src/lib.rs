@@ -3,11 +3,14 @@
 // Reference the engine so the staticlib links it and native-static-libs lists its frameworks.
 extern crate lightcraft_engine as _;
 
+mod decode_memory;
 pub mod delta_e;
 mod diagnostics;
 mod last_error;
 mod memory_budget;
 mod panic_guard;
+mod pool_idle;
+mod prepared_open;
 mod preview_scheduler;
 mod preview_stages;
 mod render_worker;
@@ -22,5 +25,5 @@ pub use status::UVStatus;
 /// It returns a constant and cannot fail, so it skips the panic guard.
 #[unsafe(no_mangle)]
 pub extern "C" fn uv_abi_version() -> u32 {
-    6
+    7
 }

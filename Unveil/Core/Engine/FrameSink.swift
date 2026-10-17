@@ -145,7 +145,8 @@ nonisolated final class FrameSink: @unchecked Sendable {
     ///
     /// `rgba` must point to `height` rows of `stride` bytes, each holding at least `width * 4`.
     /// The pointer is only read during the call. The native size is passed through to the frame,
-    /// and a published frame's `histogram` goes to `onHistogram`.
+    /// and a published frame's `histogram` goes to `onHistogram`. Logical display dimensions must
+    /// be positive but need not fit the physical buffer. Omitted dimensions use the identity raster.
     func receive(
         rgba          : UnsafeRawPointer,
         width         : Int,
@@ -157,7 +158,9 @@ nonisolated final class FrameSink: @unchecked Sendable {
         replacesWindow: Bool = false,
         nativeWidth   : Int = 0,
         nativeHeight  : Int = 0,
-        histogram     : FrameHistogram? = nil
+        histogram     : FrameHistogram? = nil,
+        displayWidth  : Int? = nil,
+        displayHeight : Int? = nil
     ) {
         guard width > 0, height > 0, stride >= width * 4 else {
             logger.error("Dropped a malformed frame: \(width)x\(height), stride \(stride)")
@@ -166,6 +169,14 @@ nonisolated final class FrameSink: @unchecked Sendable {
 
         guard width <= maxPixels, height <= maxPixels else {
             logger.error("Dropped an oversized frame: \(width)x\(height), long edge limit \(self.maxPixels)")
+            return
+        }
+
+        let logicalWidth  = displayWidth ?? width
+        let logicalHeight = displayHeight ?? height
+
+        guard logicalWidth > 0, logicalHeight > 0 else {
+            logger.error("Dropped a frame with invalid display extent: \(logicalWidth)x\(logicalHeight)")
             return
         }
 
@@ -183,22 +194,24 @@ nonisolated final class FrameSink: @unchecked Sendable {
         copyRows(
             from        : rgba,
             to          : target,
-            width       : width,
-            height      : height,
+            width        : width,
+            height       : height,
             stride      : stride,
-            bytesPerRow : bytesPerRow
+            bytesPerRow  : bytesPerRow
         )
 
         let frame = ReadyFrame(
-            bufferIndex : target,
-            width       : width,
-            height      : height,
-            bytesPerRow : bytesPerRow,
-            generation  : generation,
-            isDraft     : isDraft,
-            window      : window,
-            nativeWidth : nativeWidth,
-            nativeHeight: nativeHeight
+            bufferIndex  : target,
+            width        : width,
+            height       : height,
+            displayWidth : logicalWidth,
+            displayHeight: logicalHeight,
+            bytesPerRow  : bytesPerRow,
+            generation   : generation,
+            isDraft      : isDraft,
+            window       : window,
+            nativeWidth  : nativeWidth,
+            nativeHeight : nativeHeight
         )
 
         let (wake, hear) = state.withLock { current in

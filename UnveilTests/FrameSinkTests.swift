@@ -329,4 +329,68 @@ struct FrameSinkTests {
         #expect(published.window == nil)
         #expect(published.frame?.nativeWidth == 640 && published.frame?.nativeHeight == 427)
     }
+
+    @Test
+    func aReducedRasterKeepsLogicalCoverageWithoutInflatingItsBuffer() throws {
+        let sink = FrameSink(device: device, maxPixels: 128)
+        let placement = FrameWindow(
+            frameWidth : 2051,
+            frameHeight: 1367,
+            x          : 51,
+            y          : 43,
+            width      : 173,
+            height     : 111
+        )
+        let pixels = [UInt8](repeating: 91, count: 87 * 56 * 4)
+        pixels.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+
+            sink.receive(
+                rgba         : base,
+                width        : 87,
+                height       : 56,
+                stride       : 87 * 4,
+                generation   : 1,
+                isDraft      : true,
+                window       : placement,
+                displayWidth : 173,
+                displayHeight: 111
+            )
+        }
+        let frame = try #require(sink.published().window)
+        #expect(frame.width == 87 && frame.height == 56)
+        #expect(frame.displayWidth == 173 && frame.displayHeight == 111)
+        #expect(frame.window == placement)
+        #expect(!frame.hasIdentityRaster)
+        let bytes = sink.buffer(at: frame.bufferIndex).contents().assumingMemoryBound(to: UInt8.self)
+        #expect(bytes[55 * frame.bytesPerRow + 86 * 4 + 3] == 91)
+    }
+
+    @Test
+    func invalidLogicalExtentsCannotReplaceTheLastGoodFrame() {
+        let sink   = FrameSink(device: device, maxPixels: 8)
+        let pixels = [UInt8](repeating: 20, count: 4 * 3 * 4)
+        deliver(
+            pixels,
+            to        : sink,
+            width     : 4,
+            height    : 3,
+            generation: 1
+        )
+        pixels.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+
+            sink.receive(
+                rgba         : base,
+                width        : 4,
+                height       : 3,
+                stride       : 16,
+                generation   : 2,
+                isDraft      : true,
+                displayWidth : 0,
+                displayHeight: 3
+            )
+        }
+        #expect(sink.latest()?.generation == 1)
+    }
 }

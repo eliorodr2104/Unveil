@@ -33,8 +33,12 @@ import Foundation
 /// - `-UnveilRecordInput <s>`: a Debug build records the canvas's input events and display updates
 ///   for that many seconds (InputRecorder), from the first full frame of `-UnveilOpen` or else from
 ///   launch, so a hand-made trackpad session leaves a CSV; with `-UnveilExitAfterSweep` it then ends.
-/// - `-UnveilMemoryMap`: after the first full frame, take the E0 memory map at four moments (open, fit,
-///   100 %, back at fit), printing one `MM` line each (MemoryMapReport);
+/// - `-UnveilMemoryMap`: print `MM` at open, fit +5/+15 s, 100 %, and return to fit +10/+30 s;
+/// - `-UnveilDecodeMemory`: sample footprint every 100 ms and print bounded decode allocation events;
+/// - `-UnveilPoolBytes <bytes>`: override the free GPU reserve for a paired diagnostic comparison;
+/// - `-UnveilNoPoolIdle`: disable idle reserve trimming for that diagnostic process;
+/// - `-UnveilPoolProbe`: measure an isolated free-pool trim and the first edit afterwards;
+/// - `-UnveilMemoryCycles <1...3>`: repeat the memory map's zoom/fit sequence in one process;
 /// - `-UnveilTimeline`: print the open's phases and the engine's file loads (`TL` lines);
 /// - `-UnveilCost`: around the sweep, print its CPU, energy, GPU and render totals (`COST` line);
 /// - `-UnveilSweepFull`: the sweep releases on every tick, so every frame is a full render.
@@ -62,6 +66,11 @@ nonisolated struct MeasurementLaunchOptions: Equatable, Sendable {
     let startsHomeExpanded    : Bool
     let recordInputSeconds    : Double?
     let reportsMemoryMap      : Bool
+    let reportsDecodeMemory   : Bool
+    let poolLimitBytes        : UInt64?
+    let disablesPoolIdle      : Bool
+    let probesPool            : Bool
+    let memoryCycles          : Int
     let reportsTimeline       : Bool
     let reportsCost           : Bool
     let releasesEveryTick     : Bool
@@ -117,6 +126,11 @@ nonisolated struct MeasurementLaunchOptions: Equatable, Sendable {
         startsHomeExpanded     = arguments.contains("-UnveilHomeExpanded")
         recordInputSeconds     = positiveNumber(after: "-UnveilRecordInput")
         reportsMemoryMap       = arguments.contains("-UnveilMemoryMap")
+        reportsDecodeMemory    = arguments.contains("-UnveilDecodeMemory")
+        poolLimitBytes         = value(after: "-UnveilPoolBytes").flatMap(UInt64.init)
+        disablesPoolIdle       = arguments.contains("-UnveilNoPoolIdle")
+        probesPool             = arguments.contains("-UnveilPoolProbe")
+        memoryCycles           = value(after: "-UnveilMemoryCycles").flatMap(Int.init).map { min(3, max(1, $0)) } ?? 1
         reportsTimeline        = arguments.contains("-UnveilTimeline")
         reportsCost            = arguments.contains("-UnveilCost")
         releasesEveryTick      = arguments.contains("-UnveilSweepFull")

@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! Import: recursive folders, duplicate detection by content, add vs copy into the library.
 
 use std::path::Path;
@@ -17,7 +18,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 fn write_png(path: &Path, seed: u8) {
     let (w, h) = (48usize, 32usize);
     let data: Vec<[u8; 4]> = (0..w * h).map(|i| [(i % w * 5) as u8, (i / w * 7) as u8, seed, 255]).collect();
-    let img = lightcraft_raster::Rgba8 { width: w, height: h, data };
+    let img = lightcraft_raster::Rgba8 { width: w, height: h, data: lightcraft_raster::Buffer::Heap(data) };
     let bytes = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, bytes).unwrap();
@@ -693,7 +694,11 @@ fn assisted_culling_groups_bursts_and_scores_focus() {
             })
             .collect();
         let png = lightcraft_codecs::encode_png(
-            &lightcraft_codecs::EncodeImage::rgba8(&lightcraft_raster::Rgba8 { width: img.width, height: img.height, data }),
+            &lightcraft_codecs::EncodeImage::rgba8(&lightcraft_raster::Rgba8 {
+                width: img.width,
+                height: img.height,
+                data: lightcraft_raster::Buffer::Heap(data),
+            }),
             &Default::default(),
         )
         .unwrap();
@@ -750,7 +755,7 @@ fn dust_spots_are_found_and_healed() {
         })
         .collect();
     let png = lightcraft_codecs::encode_png(
-        &lightcraft_codecs::EncodeImage::rgba8(&lightcraft_raster::Rgba8 { width: w, height: h, data }),
+        &lightcraft_codecs::EncodeImage::rgba8(&lightcraft_raster::Rgba8 { width: w, height: h, data: lightcraft_raster::Buffer::Heap(data) }),
         &Default::default(),
     )
     .unwrap();

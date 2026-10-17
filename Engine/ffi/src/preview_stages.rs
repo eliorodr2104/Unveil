@@ -30,6 +30,12 @@ pub(crate) struct PreviewStages {
 }
 
 impl PreviewStages {
+    /// clear retires this owner; a detached render keeps its own old cache until completion.
+    pub(crate) fn clear(&mut self) {
+        self.cache = Arc::default();
+        self.owner = None;
+    }
+
     /// attach gives job the preview cache, starting a fresh one when the job is for another photo
     /// or source level than the stages held.
     pub fn attach(&mut self, job: RenderJob) -> RenderJob {
@@ -45,7 +51,7 @@ impl PreviewStages {
     /// switching photos frees them without waiting for the next preview.
     pub fn keep_only(&mut self, active: Option<PhotoId>) {
         if self.owner.is_some_and(|(photo, _)| Some(photo) != active) {
-            *self = PreviewStages::default();
+            self.clear();
         }
     }
 
@@ -56,6 +62,11 @@ impl PreviewStages {
         if self.bytes() > budget / 4 {
             self.cache = Arc::default();
         }
+    }
+
+    /// A tight crop may need the full source for its fit preview after window work ends.
+    pub(crate) fn uses_full_source(&self) -> bool {
+        self.owner.is_some_and(|(_, level)| level == SourceLevel::Full)
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -110,10 +121,7 @@ mod tests {
         }
 
         fn set_exposure(&mut self, value: f64) {
-            self.exec(
-                "develop.set",
-                json!({"control": "light.exposure", "value": value}),
-            );
+            self.exec("develop.set", json!({"control": "light.exposure", "value": value}));
         }
 
         /// render runs the active photo's preview job, with the preview stages when given, and
@@ -126,7 +134,7 @@ mod tests {
             }
             let result = job.run();
             self.session.accept(&result);
-            result.rendered.unwrap().image.data
+            result.rendered.unwrap().image.data.to_vec()
         }
     }
 
@@ -134,6 +142,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn a_retired_view_cache_cannot_be_repopulated_by_its_in_flight_job() {
+        let mut library = Library::new("view-retire");
+        let photo = library.import(641, 427);
+        let mut stages = PreviewStages::default();
+        let job = library.session.render_job(photo, 801, 801, false, true).unwrap().reduced_draft();
+        let job = stages.attach(job);
+        let retired = job.stages.as_ref().unwrap().clone();
+        stages.clear();
+        assert!(!Arc::ptr_eq(&retired, &stages.cache));
+        assert!(job.run().rendered.is_ok());
+        assert!(retired.bytes() + lightcraft_engine::gpu::stage_bytes(&retired) > 0);
+        assert_eq!(stages.bytes(), 0, "late work must not repopulate the next view cache");
+        stages.keep_only(None);
     }
 
     fn gradient_png(dir: &Path, width: u32, height: u32) -> PathBuf {
@@ -163,10 +187,7 @@ mod tests {
         let second_plain = library.render(None);
 
         assert!(first == first_plain, "exposure -0.7 differs with stages");
-        assert!(
-            second == second_plain,
-            "exposure 1.3 differs with resident stages"
-        );
+        assert!(second == second_plain, "exposure 1.3 differs with resident stages");
         assert!(first != second, "the exposure change had no effect");
     }
 
@@ -205,29 +226,17 @@ mod tests {
 
         let second = library.import(480, 320);
         stages.keep_only(Some(second));
-        assert!(
-            stages.owner.is_none() && stages.bytes() == 0,
-            "the first photo's stages survived"
-        );
+        assert!(stages.owner.is_none() && stages.bytes() == 0, "the first photo's stages survived");
         let with_stages = library.render(Some(&mut stages));
-        assert!(
-            !Arc::ptr_eq(&stages.cache, &first_cache),
-            "the second photo got the first's cache"
-        );
+        assert!(!Arc::ptr_eq(&stages.cache, &first_cache), "the second photo got the first's cache");
         assert_eq!(stages.owner.map(|(photo, _)| photo), Some(second));
-        assert!(
-            with_stages == library.render(None),
-            "the second photo differs with stages"
-        );
+        assert!(with_stages == library.render(None), "the second photo differs with stages");
 
         // attach alone, without keep_only, must also start over for another photo
         library.exec("library.select", json!({"ids": [first.0], "active": first.0}));
         let second_cache = stages.cache.clone();
         library.render(Some(&mut stages));
-        assert!(
-            !Arc::ptr_eq(&stages.cache, &second_cache),
-            "the first photo got the second's cache"
-        );
+        assert!(!Arc::ptr_eq(&stages.cache, &second_cache), "the first photo got the second's cache");
     }
 
     /// a_windows_histogram_frame_shares_the_preview_stages_without_evicting_them: the 512 px frame
@@ -246,19 +255,13 @@ mod tests {
 
         let job = library.session.render_job(id, 2048, 2048, false, true).unwrap();
         let small = library.session.render_job(id, 512, 512, false, true).unwrap();
-        assert_ne!(
-            small.level, job.level,
-            "a plain 512 px job reads the preview level"
-        );
+        assert_ne!(small.level, job.level, "a plain 512 px job reads the preview level");
         let job = stages.attach(crate::session::histogram_fit(job));
         let result = job.run();
         library.session.accept(&result);
         let image = result.rendered.unwrap().image;
         assert_eq!(image.width.max(image.height), 512);
-        assert!(
-            Arc::ptr_eq(&stages.cache, &cache),
-            "the histogram frame replaced the preview stages"
-        );
+        assert!(Arc::ptr_eq(&stages.cache, &cache), "the histogram frame replaced the preview stages");
         let both = stages.bytes();
         // 512 x 341 against 2048 x 1365 is about 6 % of the pixels.
         assert!(
@@ -267,10 +270,7 @@ mod tests {
         );
 
         assert!(library.render(Some(&mut stages)) == preview);
-        assert!(
-            Arc::ptr_eq(&stages.cache, &cache),
-            "the next preview replaced the stages"
-        );
+        assert!(Arc::ptr_eq(&stages.cache, &cache), "the next preview replaced the stages");
         assert_eq!(stages.bytes(), both, "the next preview evicted a size");
     }
 

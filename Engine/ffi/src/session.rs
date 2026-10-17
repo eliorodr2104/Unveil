@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use lightcraft_engine::catalog::PhotoId;
+use lightcraft_engine::files::PreparedSources;
 use lightcraft_engine::pipeline::geometry::Frame;
 use lightcraft_engine::pipeline::{PixelWindow, Rendered};
 use lightcraft_engine::{RenderJob, Session, SourceLevel};
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 use crate::diagnostics::{self, Category, Part, Span};
 use crate::memory_budget::install_release_hook;
 use crate::panic_guard::{guard, panic_message};
+use crate::prepared_open;
 use crate::preview_scheduler::{PreviewScheduler, Request};
 use crate::preview_stages::PreviewStages;
 use crate::render_worker::{RenderDone, RenderWorker, Work};
@@ -49,6 +51,7 @@ unsafe extern "C" {
 /// one only when its request asked for it (ABI 6) and its small whole frame rendered: the histogram
 /// of that frame, rendered with the window's settings, so it still describes the whole photo. If
 /// the small frame fails, the window is still delivered, with `histogram` NULL.
+/// `display_width` and `display_height` preserve logical coverage when a draft has fewer pixels.
 #[repr(C)]
 #[derive(Debug)]
 pub struct UVFrame {
@@ -69,6 +72,8 @@ pub struct UVFrame {
     pub status: i32,
     pub error: *const c_char,
     pub histogram: *const UVHistogram,
+    pub display_width: u32,
+    pub display_height: u32,
 }
 
 /// UVHistogram of uv.h: the engine's histogram of a whole frame, 256 bins per channel and for
@@ -89,7 +94,7 @@ pub struct UVHistogram {
 impl UVHistogram {
     /// of copies the histogram the engine computed with the frame. Upstream's bins are always 256
     /// long; a shorter one would leave its missing bins at 0 rather than fail the frame.
-    fn of(rendered: &Rendered) -> UVHistogram {
+    fn of<I>(rendered: &Rendered<I>) -> UVHistogram {
         let h = &rendered.histogram;
         let bins = |v: &[u32]| {
             let mut out = [0u32; 256];
@@ -145,56 +150,57 @@ pub(crate) struct FrameCallback {
 unsafe impl Send for FrameCallback {}
 
 impl FrameCallback {
-    /// call hands the frame's pixels to the callback without a copy: RGBA8, rows of width * 4.
+    /// call borrows the frame's RGBA8 pixels; mapped crops can have a larger row stride.
     /// Without a placement the pixels are the whole frame. `whole_frame` is the small whole frame a
     /// window's histogram comes from, if one was rendered.
     fn call(
         &self,
-        rendered: &Rendered,
+        rendered: &Rendered<lightcraft_gpu::DisplayImage>,
         whole_frame: Option<&Rendered>,
         generation: u64,
         draft: bool,
         delivery: Delivery,
     ) {
         let image = &rendered.image;
-        let rgba = image.data.as_flattened();
-        let (width, height) = (image.width as u32, image.height as u32);
-        let whole = Placement {
-            frame_width: width,
-            frame_height: height,
-            x: 0,
-            y: 0,
-        };
-        let at = delivery.placement.unwrap_or(whole);
-        // A window's own histogram covers only the window; the app's describes the whole photo.
-        let histogram = match delivery.placement {
-            None => Some(UVHistogram::of(rendered)),
-            Some(_) => whole_frame.map(UVHistogram::of),
-        };
-        let frame = UVFrame {
-            rgba: rgba.as_ptr(),
-            width,
-            height,
-            stride: width * 4,
-            generation,
-            draft,
-            window: delivery.placement.is_some(),
-            fallback: delivery.fallback,
-            frame_width: at.frame_width,
-            frame_height: at.frame_height,
-            x: at.x,
-            y: at.y,
-            native_width: delivery.native.0,
-            native_height: delivery.native.1,
-            status: UVStatus::UV_OK as i32,
-            error: std::ptr::null(),
-            histogram: histogram
-                .as_ref()
-                .map_or(std::ptr::null(), |h| h as *const UVHistogram),
-        };
-        // SAFETY: frame, its pixels (owned by the RenderResult) and histogram outlive the call, which
-        // is all uv_frame_cb promises; ctx is valid per the request's contract.
-        unsafe { (self.f)(self.ctx, &frame) };
+        let result = image.with_pixels(|rgba, stride| {
+            let (width, height) = (image.width as u32, image.height as u32);
+            let (display_width, display_height) =
+                (rendered.display_size.0 as u32, rendered.display_size.1 as u32);
+            let whole = Placement { frame_width: display_width, frame_height: display_height, x: 0, y: 0 };
+            let at = delivery.placement.unwrap_or(whole);
+            // A window's own histogram covers only the window; the app's describes the whole photo.
+            let histogram = match delivery.placement {
+                None => Some(UVHistogram::of(rendered)),
+                Some(_) => whole_frame.map(UVHistogram::of),
+            };
+            let frame = UVFrame {
+                rgba: rgba.as_ptr(),
+                width,
+                height,
+                stride: stride as u32,
+                generation,
+                draft,
+                window: delivery.placement.is_some(),
+                fallback: delivery.fallback,
+                frame_width: at.frame_width,
+                frame_height: at.frame_height,
+                x: at.x,
+                y: at.y,
+                native_width: delivery.native.0,
+                native_height: delivery.native.1,
+                status: UVStatus::UV_OK as i32,
+                error: std::ptr::null(),
+                histogram: histogram.as_ref().map_or(std::ptr::null(), |h| h as *const UVHistogram),
+                display_width,
+                display_height,
+            };
+            // SAFETY: frame, its pixels (owned by the RenderResult) and histogram outlive the call, which
+            // is all uv_frame_cb promises; ctx is valid per the request's contract.
+            unsafe { (self.f)(self.ctx, &frame) };
+        });
+        if let Err(message) = result {
+            self.call_failure(generation, draft, delivery, Failure::new(UVStatus::UV_ERR_ENGINE, message));
+        }
     }
 
     /// call_failure tells the callback that a render failed: no pixels, `status` and `message`
@@ -220,6 +226,8 @@ impl FrameCallback {
             status: failure.status as i32,
             error: message.as_ptr(),
             histogram: std::ptr::null(),
+            display_width: 0,
+            display_height: 0,
         };
         // SAFETY: frame and message outlive the call, which is all uv_frame_cb promises; ctx is
         // valid per the request's contract.
@@ -244,14 +252,8 @@ pub(crate) struct PreviewRequest {
 /// `window`'s pixels of the frame fitted in `full_w × full_h`.
 #[derive(Clone, Copy)]
 enum RequestKind {
-    Fit {
-        max_pixels: u32,
-    },
-    Window {
-        full_w: u32,
-        full_h: u32,
-        window: PixelWindow,
-    },
+    Fit { max_pixels: u32 },
+    Window { full_w: u32, full_h: u32, window: PixelWindow },
 }
 
 impl Request for PreviewRequest {
@@ -299,6 +301,7 @@ pub struct UVSession {
     generation: AtomicU64,
     has_active: Arc<AtomicBool>,
     suspended: Arc<AtomicBool>,
+    prepared: Arc<PreparedSources>,
 }
 
 impl UVSession {
@@ -309,9 +312,11 @@ impl UVSession {
         let (ready_tx, ready_rx) = mpsc::channel();
         let has_active = Arc::new(AtomicBool::new(false));
         let suspended = Arc::new(AtomicBool::new(false));
+        let prepared = Arc::new(PreparedSources::new(128 << 20));
         let flags = Flags {
             has_active: has_active.clone(),
             suspended: suspended.clone(),
+            prepared: prepared.clone(),
         };
         let done = tx.clone();
         let thread = thread::Builder::new()
@@ -319,10 +324,7 @@ impl UVSession {
             .stack_size(8 << 20)
             .spawn(move || engine_main(data_dir, memory_budget, rx, done, flags, ready_tx))
             .map_err(|e| {
-                Failure::new(
-                    UVStatus::UV_ERR_ENGINE,
-                    format!("cannot start the engine thread: {e}"),
-                )
+                Failure::new(UVStatus::UV_ERR_ENGINE, format!("cannot start the engine thread: {e}"))
             })?;
         let failure = match ready_rx.recv() {
             Ok(Ok(())) => {
@@ -332,6 +334,7 @@ impl UVSession {
                     generation: AtomicU64::new(0),
                     has_active,
                     suspended,
+                    prepared,
                 });
             }
             Ok(Err(failure)) => failure,
@@ -343,19 +346,12 @@ impl UVSession {
 
     fn execute(&self, command: &str, params: Value) -> Result<Value, Failure> {
         let (reply, rx) = mpsc::channel();
-        self.tx
-            .send(Msg::Execute {
-                command: command.to_owned(),
-                params,
-                reply,
-            })
-            .map_err(|_| stopped())?;
+        self.tx.send(Msg::Execute { command: command.to_owned(), params, reply }).map_err(|_| stopped())?;
         match rx.recv_timeout(EXECUTE_TIMEOUT) {
             Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => Err(Failure::new(
-                UVStatus::UV_ERR_TIMEOUT,
-                format!("`{command}` took longer than 30 s"),
-            )),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(Failure::new(UVStatus::UV_ERR_TIMEOUT, format!("`{command}` took longer than 30 s")))
+            }
             Err(RecvTimeoutError::Disconnected) => Err(stopped()),
         }
     }
@@ -364,14 +360,14 @@ impl UVSession {
     /// pending one is dropped). On UV_OK nothing renders until resume.
     fn suspend(&self) -> Result<(), Failure> {
         self.suspended.store(true, Ordering::Release);
+        self.prepared.clear();
         let (reply, rx) = mpsc::channel();
         self.tx.send(Msg::Suspend { reply }).map_err(|_| stopped())?;
         match rx.recv_timeout(SUSPEND_TIMEOUT) {
             Ok(()) => Ok(()),
-            Err(RecvTimeoutError::Timeout) => Err(Failure::new(
-                UVStatus::UV_ERR_TIMEOUT,
-                "a render is still in flight after 2 s",
-            )),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(Failure::new(UVStatus::UV_ERR_TIMEOUT, "a render is still in flight after 2 s"))
+            }
             Err(RecvTimeoutError::Disconnected) => Err(stopped()),
         }
     }
@@ -388,10 +384,7 @@ impl UVSession {
         ctx: *mut c_void,
     ) -> Result<u64, Failure> {
         if self.suspended.load(Ordering::Acquire) {
-            return Err(Failure::new(
-                UVStatus::UV_ERR_SUSPENDED,
-                "the session is suspended",
-            ));
+            return Err(Failure::new(UVStatus::UV_ERR_SUSPENDED, "the session is suspended"));
         }
         if !self.has_active.load(Ordering::Acquire) {
             return Err(Failure::new(UVStatus::UV_ERR_ENGINE, "no active photo"));
@@ -408,14 +401,8 @@ impl UVSession {
             _ => {}
         }
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let request = PreviewRequest {
-            generation,
-            kind,
-            draft,
-            before,
-            histogram,
-            callback: FrameCallback { f, ctx },
-        };
+        let request =
+            PreviewRequest { generation, kind, draft, before, histogram, callback: FrameCallback { f, ctx } };
         self.tx.send(Msg::Preview(request)).map_err(|_| stopped())?;
         Ok(generation)
     }
@@ -423,6 +410,7 @@ impl UVSession {
 
 impl Drop for UVSession {
     fn drop(&mut self) {
+        self.prepared.clear();
         let _ = self.tx.send(Msg::Shutdown);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -448,10 +436,11 @@ pub(crate) fn caught<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
         .ok()
 }
 
-/// Flags are the atomics the engine thread shares with UVSession.
+/// Flags are the atomics and prepared-source owner the engine thread shares with UVSession.
 struct Flags {
     has_active: Arc<AtomicBool>,
     suspended: Arc<AtomicBool>,
+    prepared: Arc<PreparedSources>,
 }
 
 /// engine_main is the body of the engine thread. It reports the library open over `ready`, then
@@ -475,7 +464,7 @@ fn engine_main(
             return;
         }
     };
-    let mut session = Session::new().with_fs();
+    let mut session = Session::new().with_prepared_fs(flags.prepared.clone());
     diagnostics::instrument_loads(&mut session);
     if let Err(e) = session.open_library(&data_dir, false) {
         let _ = ready.send(Err(Failure::engine(e)));
@@ -498,17 +487,35 @@ fn engine_main(
         worker,
         flags,
         suspend_waiter: None,
+        pool_idle: crate::pool_idle::PoolIdle::default(),
     };
     engine.publish_active();
     let _ = ready.send(Ok(()));
-    while let Ok(msg) = rx.recv() {
+    loop {
+        // Observe the deadline even while read-only diagnostic messages keep arriving.
+        engine.trim_idle_pool();
+        let timeout =
+            [engine.flags.prepared.pending_timeout(), engine.pool_idle.remaining(std::time::Instant::now())]
+                .into_iter()
+                .flatten()
+                .min();
+        let received = match timeout {
+            Some(timeout) => rx.recv_timeout(timeout),
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        let msg = match received {
+            Ok(msg) => msg,
+            Err(RecvTimeoutError::Timeout) => {
+                engine.flags.prepared.expire_pending();
+                engine.trim_idle_pool();
+                lightcraft_engine::memory::release();
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match msg {
             Msg::Shutdown => break,
-            Msg::Execute {
-                command,
-                params,
-                reply,
-            } => {
+            Msg::Execute { command, params, reply } => {
                 let result = engine.execute(&command, &params);
                 engine.publish_active();
                 engine.stages.keep_only(engine.session.active());
@@ -516,6 +523,7 @@ fn engine_main(
                 let _ = reply.send(result);
             }
             Msg::Preview(request) => {
+                engine.pool_idle.cancel();
                 // A request that raced uv_suspend: the caller was told "suspended" or will be.
                 if engine.flags.suspended.load(Ordering::Acquire) {
                     continue;
@@ -527,9 +535,9 @@ fn engine_main(
                 }
             }
             Msg::SetBudget(bytes) => {
-                if let Some(budget) = caught("set_memory_budget", || {
-                    engine.session.set_memory_budget(bytes as usize)
-                }) {
+                if let Some(budget) =
+                    caught("set_memory_budget", || engine.session.set_memory_budget(bytes as usize))
+                {
                     engine.trim_stages(budget);
                 }
             }
@@ -539,11 +547,14 @@ fn engine_main(
                 engine.release_windows();
             }
             Msg::Suspend { reply } => {
+                engine.pool_idle.cancel();
                 engine.scheduler.clear_pending();
                 // Drop the stages (171 MB NEF, 153 MB RAF at 2360 px, measured on the Mac at the iPad budget)
                 // into the GPU pool, emptied by uv_suspend; a render in flight keeps its copy until it ends.
                 engine.stages = PreviewStages::default();
                 engine.window_stages = PreviewStages::default();
+                engine.session.media.release_device_sources();
+                engine.session.media.release_full_source();
                 engine.suspend_waiter = Some(reply);
                 engine.answer_suspend();
             }
@@ -576,38 +587,93 @@ struct Engine {
     worker: RenderWorker,
     flags: Flags,
     suspend_waiter: Option<Sender<()>>,
+    pool_idle: crate::pool_idle::PoolIdle,
 }
 
 impl Engine {
+    fn trim_idle_pool(&mut self) {
+        if self.scheduler.is_idle() && self.pool_idle.take_due(Instant::now()) {
+            lightcraft_engine::files::decode_memory::checkpoint("pool-trim-begin");
+            lightcraft_gpu::trim_reusable(0);
+            lightcraft_engine::files::decode_memory::checkpoint("pool-trim-end");
+            lightcraft_engine::memory::release();
+        }
+    }
+
     fn execute(&mut self, command: &str, params: &Value) -> Result<Value, Failure> {
-        // The `unveil.` commands are the bridge's own read-only diagnostics, not engine commands.
+        // Bridge diagnostics; experimental pool controls require an explicitly enabled session.
         match command {
             "unveil.diagnostics" => {
                 let enabled = params.get("enabled").and_then(Value::as_bool).unwrap_or(false);
                 return Ok(diagnostics::set_enabled(enabled));
             }
             "unveil.loads" => return Ok(diagnostics::loads_json()),
+            "unveil.decode-memory" => {
+                return Ok(crate::decode_memory::command(params.get("enabled").and_then(Value::as_bool)));
+            }
+            "unveil.pool" => {
+                if diagnostics::is_enabled() {
+                    if let Some(limit) = params.get("limitBytes").and_then(Value::as_u64) {
+                        lightcraft_gpu::set_pool_limit(limit);
+                    }
+                    if let Some(keep) = params.get("trimFreeBytes").and_then(Value::as_u64) {
+                        lightcraft_gpu::trim_reusable(keep);
+                    }
+                    if let Some(enabled) = params.get("idleTrim").and_then(Value::as_bool) {
+                        self.pool_idle.set_enabled(enabled);
+                        if self.scheduler.is_idle() && !self.flags.suspended.load(Ordering::Acquire) {
+                            self.pool_idle.completed(Instant::now());
+                        }
+                    }
+                }
+                let stats =
+                    lightcraft_gpu::pool_stats(params.get("reset").and_then(Value::as_bool).unwrap_or(false));
+                return Ok(json!({
+                    "limitBytes": lightcraft_gpu::pool_limit(),
+                    "allocated": lightcraft_gpu::memory().allocated, "pooled": lightcraft_gpu::memory().pooled,
+                    "allocatedPeak": stats.allocated_peak, "pooledPeak": stats.pooled_peak,
+                    "sourceUploads": lightcraft_gpu::source_uploads(), "incomplete": stats.incomplete,
+                    "buckets": stats.buckets.iter().map(|b| json!({
+                        "upperBytes": b.upper_bytes, "usage": b.usage, "allocations": b.allocations,
+                        "reuses": b.reuses, "returns": b.returns, "frees": b.frees,
+                    })).collect::<Vec<_>>(),
+                }));
+            }
             "unveil.renders" => {
                 let reset = params.get("reset").and_then(Value::as_bool).unwrap_or(false);
                 return Ok(diagnostics::renders_json(reset));
             }
             _ => {}
         }
+        let previous_path = prepared_open::active_path(&self.session);
+        let preparation = prepared_open::before(&self.flags.prepared, command, params);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.session.execute(command, params).map_err(Failure::engine)
         }))
         .unwrap_or_else(|p| {
-            Err(Failure::new(
-                UVStatus::UV_ERR_PANIC,
-                format!("panic: {}", panic_message(&*p)),
-            ))
+            Err(Failure::new(UVStatus::UV_ERR_PANIC, format!("panic: {}", panic_message(&*p))))
         });
+        prepared_open::after(
+            &self.flags.prepared,
+            &self.session,
+            command,
+            previous_path.as_deref(),
+            preparation,
+            &result,
+        );
+        if previous_path != prepared_open::active_path(&self.session) {
+            self.pool_idle.cancel();
+            if self.scheduler.is_idle() {
+                self.pool_idle.completed(Instant::now());
+            }
+        }
         // library.memory also tells what the two views' resident stages hold (host and device).
         match (command, result) {
             ("library.memory", Ok(mut memory)) => {
                 memory["unveil"] = json!({
                     "previewStages": { "cpu": self.stages.cpu_bytes(), "gpu": self.stages.gpu_bytes() },
                     "windowStages": { "cpu": self.window_stages.cpu_bytes(), "gpu": self.window_stages.gpu_bytes() },
+                    "preparedSource": prepared_open::memory(&self.flags.prepared),
                 });
                 Ok(memory)
             }
@@ -624,8 +690,8 @@ impl Engine {
         }
     }
 
-    /// trim_stages keeps both views' stages within a quarter of `budget` together (PreviewStages::trim
-    /// is the rule for one view), dropping the window's first: the preview is the one always shown.
+    /// trim_stages applies the shared quarter-budget to both views. The window goes first,
+    /// preserving the fit preview for as long as the budget permits.
     fn trim_stages(&mut self, budget: usize) {
         if self.stages.bytes() + self.window_stages.bytes() > budget / 4 {
             self.window_stages = PreviewStages::default();
@@ -634,11 +700,16 @@ impl Engine {
     }
 
     /// release_windows ends a uv_release_windows once no render is in flight, when the dropped
-    /// window stages have reached the GPU pool: emptying the pool frees them along with upstream's
-    /// shared device copy of the full-size source, then the heap gives the freed pages back.
+    /// window stages have reached the GPU pool. Release the full original unless the fit preview
+    /// still needs it, then return pooled buffers and freed host pages.
     fn release_windows(&mut self) {
         if self.is_release_pending && self.scheduler.is_idle() {
             self.is_release_pending = false;
+            self.pool_idle.cancel();
+            // A tight crop can use Full even in the fit preview. Keep that active source.
+            if !self.stages.uses_full_source() {
+                self.session.media.release_full_source();
+            }
             lightcraft_gpu::trim_pool(0);
             lightcraft_engine::memory::release();
         }
@@ -654,20 +725,20 @@ impl Engine {
     fn start(&mut self, mut request: PreviewRequest) {
         loop {
             if let Some((job, histogram_job, delivery)) = self.job_for(&request) {
-                let work = Work {
-                    job,
-                    histogram_job,
-                    draft: request.draft,
-                    delivery,
-                    callback: request.callback,
-                };
+                let work =
+                    Work { job, histogram_job, draft: request.draft, delivery, callback: request.callback };
                 if self.worker.run(work) {
                     return;
                 }
             }
             match self.scheduler.finished(request.generation) {
                 Some(next) => request = next,
-                None => return,
+                None => {
+                    if !self.flags.suspended.load(Ordering::Acquire) {
+                        self.pool_idle.completed(Instant::now());
+                    }
+                    return;
+                }
             }
         }
     }
@@ -687,16 +758,11 @@ impl Engine {
                 self.preview_pixels = max_pixels;
                 (self.fit_job(active, max_pixels, request.before)?, None, false)
             }
-            RequestKind::Window {
-                full_w,
-                full_h,
-                window,
-            } => {
+            RequestKind::Window { full_w, full_h, window } => {
                 let (full_w, full_h) = (full_w as usize, full_h as usize);
                 let region = caught("region_job", || {
                     if request.before {
-                        self.session
-                            .region_job_before(active, full_w, full_h, window, true)
+                        self.session.region_job_before(active, full_w, full_h, window, true)
                     } else {
                         self.session.region_job(active, full_w, full_h, window, true)
                     }
@@ -704,7 +770,7 @@ impl Engine {
                 match region {
                     Some(job) => {
                         let placement = placement_of(&frame, full_w, full_h, window);
-                        (self.window_stages.attach(job), Some(placement), false)
+                        (job, Some(placement), false)
                     }
                     None => {
                         let long_edge = window.w.max(window.h) as u32;
@@ -714,8 +780,10 @@ impl Engine {
             }
         };
         if request.draft {
-            job = job.draft();
+            job = job.reduced_draft();
         }
+        // Drafts share native processing stages; only their delivered display raster is reduced.
+        job = if placement.is_some() { self.window_stages.attach(job) } else { self.stages.attach(job) };
         let is_repeat = fallback && self.last_fallback == Some(job.key);
         self.last_fallback = fallback.then_some(job.key);
         if is_repeat {
@@ -733,11 +801,7 @@ impl Engine {
         } else {
             None
         };
-        let delivery = Delivery {
-            placement,
-            fallback,
-            native,
-        };
+        let delivery = Delivery { placement, fallback, native };
         Some((job, histogram_job, delivery))
     }
 
@@ -748,20 +812,19 @@ impl Engine {
     /// sizes, so the preview's and this one stay warm side by side.
     fn histogram_job(&mut self, active: PhotoId, before: bool) -> Option<RenderJob> {
         let job = self.fit_job(active, self.preview_pixels, before)?;
+        let job = self.stages.attach(job);
         Some(histogram_fit(job))
     }
 
-    /// fit_job is the whole-frame preview of `active` fitted in `max_pixels`, with the preview stages.
+    /// fit_job builds the whole-frame preview before its draft/full stage owner is selected.
     /// `before` renders the unedited look. Stages are keyed by the inputs they depend on, so the looks
     /// share what they have in common and never read a stage of the other's settings; an edit to
     /// white balance, noise reduction, spots or optics makes them replace each other's linear stage,
     /// so the first frame after a toggle recomputes it.
     fn fit_job(&mut self, active: PhotoId, max_pixels: u32, before: bool) -> Option<RenderJob> {
         let max = max_pixels as usize;
-        let job = caught("render_job", || {
-            self.session.render_job(active, max, max, before, true)
-        })??;
-        Some(self.stages.attach(job))
+        let job = caught("render_job", || self.session.render_job(active, max, max, before, true))??;
+        Some(job)
     }
 
     /// finish caches what the render decoded, delivers the frame, or its failure, if it is still
@@ -787,26 +850,24 @@ impl Engine {
                 .ok()
         });
         let active = self.session.active().map(|p| p.0);
-        if self
-            .scheduler
-            .should_deliver(done.generation, done.photo.0, active)
-        {
+        if self.scheduler.should_deliver(done.generation, done.photo.0, active) {
             let category = Category::of(done.draft, done.delivery.placement.is_some());
             let span = Span::start();
             match outcome {
                 Ok(rendered) => {
-                    done.callback
-                        .call(rendered, whole_frame, done.generation, done.draft, done.delivery);
+                    done.callback.call(rendered, whole_frame, done.generation, done.draft, done.delivery);
                     diagnostics::record(category, Part::Deliver, &span);
                 }
                 Err(failure) => {
-                    done.callback
-                        .call_failure(done.generation, done.draft, done.delivery, failure)
+                    done.callback.call_failure(done.generation, done.draft, done.delivery, failure)
                 }
             }
         }
+        self.trim_stages(lightcraft_engine::memory::budget());
         if let Some(next) = self.scheduler.finished(done.generation) {
             self.start(next);
+        } else if self.scheduler.is_idle() && !self.flags.suspended.load(Ordering::Acquire) {
+            self.pool_idle.completed(std::time::Instant::now());
         }
     }
 
@@ -828,6 +889,7 @@ pub(crate) fn histogram_fit(mut job: RenderJob) -> RenderJob {
     let edge = (job.request.max_w.max(job.request.max_h) ^ HISTOGRAM_PIXELS) as u64;
     job.request.max_w = HISTOGRAM_PIXELS;
     job.request.max_h = HISTOGRAM_PIXELS;
+    job.request.raster_scale = lightcraft_engine::pipeline::RasterScale::Native;
     // Swaps the fitted size in the key: the result is the key render_job gives a 512 px fit at
     // this level (XOR distributes over the shifts).
     job.key ^= (edge << 40) ^ (edge << 20);
@@ -880,9 +942,7 @@ unsafe fn c_str<'a>(ptr: *const c_char, name: &str) -> Result<&'a str, Failure> 
         return Err(Failure::invalid(format!("{name} is NULL")));
     }
     // SAFETY: non-NULL and NUL-terminated per the caller's contract; the borrow ends with the call.
-    unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map_err(|_| Failure::invalid(format!("{name} is not UTF-8")))
+    unsafe { CStr::from_ptr(ptr) }.to_str().map_err(|_| Failure::invalid(format!("{name} is not UTF-8")))
 }
 
 /// uv_session_new opens the library at data_dir on a new engine thread, or returns NULL with
@@ -1003,14 +1063,7 @@ pub unsafe extern "C" fn uv_request_preview(
     guard(|| {
         // SAFETY: a live session per the contract; it is only borrowed for this call.
         let session = unsafe { session.as_ref() }.ok_or_else(|| Failure::invalid("session is NULL"))?;
-        session.request(
-            RequestKind::Fit { max_pixels },
-            draft,
-            before,
-            false,
-            callback,
-            ctx,
-        )
+        session.request(RequestKind::Fit { max_pixels }, draft, before, false, callback, ctx)
     })
 }
 
@@ -1054,27 +1107,16 @@ pub unsafe extern "C" fn uv_request_window(
     guard(|| {
         // SAFETY: a live session per the contract; it is only borrowed for this call.
         let session = unsafe { session.as_ref() }.ok_or_else(|| Failure::invalid("session is NULL"))?;
-        let window = PixelWindow {
-            x: x as usize,
-            y: y as usize,
-            w: w as usize,
-            h: h as usize,
-        };
-        let kind = RequestKind::Window {
-            full_w,
-            full_h,
-            window,
-        };
+        let window = PixelWindow { x: x as usize, y: y as usize, w: w as usize, h: h as usize };
+        let kind = RequestKind::Window { full_w, full_h, window };
         session.request(kind, draft, before, histogram, callback, ctx)
     })
 }
 
 /// uv_release_windows frees what zoom windows keep resident, for a view that no longer shows one:
-/// the window's stages at once, then, as soon as no render is in flight, the GPU buffer pool, which
-/// also frees upstream's shared device copy of the full-size source (trim_pool(0)), and the heap's
-/// freed pages. It never waits. The whole-frame preview's stages stay. A window requested before
-/// the release completes cancels the rest of it; a later one uploads its source again (the decoded
-/// original stays in the engine's budgeted cache, so it is not decoded again).
+/// its Full and Draft stages at once, then the full source, pool and freed heap pages once idle.
+/// A tight-crop preview keeps a Full source it still uses. The call never waits. A window requested
+/// before the release completes cancels the remaining release; re-entry after eviction reloads.
 ///
 /// # Safety
 /// `session` is NULL or a live pointer from uv_session_new.
@@ -1142,6 +1184,7 @@ pub unsafe extern "C" fn uv_set_memory_budget(session: *mut UVSession, bytes: u6
     guard(|| {
         // SAFETY: a live session per the contract; it is only borrowed for this call.
         let session = unsafe { session.as_ref() }.ok_or_else(|| Failure::invalid("session is NULL"))?;
+        session.prepared.clear();
         lightcraft_engine::memory::set_budget(bytes as usize);
         session.tx.send(Msg::SetBudget(bytes)).map_err(|_| stopped())?;
         Ok(())
