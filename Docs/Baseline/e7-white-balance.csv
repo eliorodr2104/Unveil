@@ -1,0 +1,4 @@
+case,baseline_median_ns,corrected_median_ns,baseline_min_ns,corrected_min_ns
+jpeg-default,210.58,194.57,184.30,135.70
+jpeg-custom-wb,174.81,140.81,141.76,106.89
+raw-as-shot,176.33,167.60,131.36,123.77
