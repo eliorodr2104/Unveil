@@ -24,9 +24,12 @@ import UIKit
 /// velocity as momentum. The spring runs on the same display link as the redraw, so the link stays
 /// awake only while something moves. `onZoomChange` reports the zoom percentage for the editor's pill.
 ///
-/// There is no polling. A CAMetalDisplayLink runs only while something is dirty: a new frame, a
-/// transform change or a new drawable size marks the view, the next tick draws once, and the link
-/// pauses again. A view with nothing to draw costs no CPU and no GPU.
+/// A CADisplayLink advances animation and requests a drawable only when the canvas is dirty.
+/// A dedicated serial queue acquires it without blocking main, then main encodes the newest state.
+/// Active input and animation can prepare one drawable after GPU completion, ready for the next
+/// dirty tick, so the transform is sampled at that tick even when acquisition finished late.
+/// The link pauses while idle; an unused prepared drawable is released on its first idle tick.
+/// Temporary failures get three delayed retries; after that only new demand wakes the canvas.
 ///
 /// Above the preview's own resolution (more than one screen pixel per preview pixel) the canvas
 /// asks, through `onVisibleWindowChange`, for the visible window of the photo rendered at the zoom
@@ -57,7 +60,7 @@ import UIKit
 /// The sink double-buffers each kind of frame, so a GPU pass that samples buffer A while the
 /// engine publishes twice would read A as it is rewritten (a torn frame, visual only, gone on the
 /// next frame). Two rules keep that rare and visible: at most one command buffer samples the sink
-/// at a time (a tick that finds one in flight retries on the next tick), and the completed handler
+/// at a time (its completion wakes any pending redraw), and the completed handler
 /// counts the passes that may have torn, in `possibleTearCount`, so T13 can decide whether a
 /// fourth buffer is needed.
 final class CanvasView: UIView {
@@ -75,14 +78,40 @@ final class CanvasView: UIView {
     private let renderPass  = MTLRenderPassDescriptor()
     private let crossThread = CrossThreadState()
 
-    private var displayLink   : CAMetalDisplayLink?
+    private var displayLink   : CADisplayLink?
     private var isDirty       : Bool = false
     private var laidOutSize   : CGSize = .zero
     private var cachedTextures: InlineArray<3, CachedTexture?> = [nil, nil, nil]
 
-    /// wantedDrawOnLastTick is whether the last tick found the view dirty with the link running on,
-    /// so the next present follows it by one refresh unless something hitched (FrameTimingProbe).
+    /// wantedDrawOnLastTick identifies adjacent dirty ticks for FrameTimingProbe. A brief pause
+    /// during acquisition preserves continuity; an actual idle gap is excluded by the tick times.
     private var wantedDrawOnLastTick = false
+
+    /// hasDrawWaitingForGPU preserves continuity when pending demand waits through a long GPU pass.
+    private var hasDrawWaitingForGPU = false
+
+    /// readyDrawable holds one drawable prepared during active input or animation. The next tick
+    /// consumes it or releases it if no drawing demand remains, even while a finger stays down.
+    private var readyDrawable: (result: AcquiredDrawable, token: DrawableRequestState.Token)?
+
+    private var isAnimatingTransform: Bool { spring != nil || !zoomEasing.isIdle }
+
+    /// canAnticipateDraw identifies input that may need another frame after this GPU pass. A
+    /// prepared drawable gets one tick to be used; this condition does not keep idle ticks running.
+    private var canAnticipateDraw: Bool {
+        isAnimatingTransform || isGestureActive || isMeasurementPanning
+    }
+
+    private var isInsideDisplayTick = false
+    private var recordedTickDrawable: Int?
+
+    private var drawableRequests = DrawableRequestState()
+    private var drawableRetry   : Task<Void, Never>?
+
+    /// acquireNextDrawable retains the injected provider's method once, keeping this UIKit type
+    /// concrete while its initializer statically checks DrawableAcquiring. Set before frame callbacks.
+    private var acquireNextDrawable:
+        (@MainActor (@escaping @MainActor @Sendable (AcquiredDrawable?) -> Void) -> Void)?
 
     private let pinchRecognizer = UIPinchGestureRecognizer()
     private let panRecognizer   = UIPanGestureRecognizer()
@@ -132,9 +161,9 @@ final class CanvasView: UIView {
     /// holdDuration is how long a still finger must stay down before the before look shows.
     static let holdDuration: TimeInterval = 0.35
 
-    private var spring           : CanvasSpring?
-    private var springStartTime  : CFTimeInterval = 0
-    private var lastFullFrameSize: CGSize = .zero
+    private var spring         : CanvasSpring?
+    private var springStartTime : CFTimeInterval = 0
+    private var previewGeometry = PreviewGeometry()
 
     /// lastTickTime is the target presentation time of the last display link update, the frame the
     /// transform on screen belongs to; a new spring starts there (CanvasSpring.startTime). The
@@ -330,10 +359,9 @@ final class CanvasView: UIView {
     // Nonisolated: the engine thread and Metal's completion thread use it, the app default is MainActor.
     private nonisolated final class CrossThreadState: Sendable {
 
-        let isHopPending            = Atomic<Bool>(false)
-        let isCommandBufferInFlight = Atomic<Bool>(false)
-        let possibleTears           = Atomic<Int>(0)
-        let droppedFrames           = Mutex(DroppedFrameRetries())
+        let isHopPending  = Atomic<Bool>(false)
+        let possibleTears = Atomic<Int>(0)
+        let droppedFrames = Mutex(DroppedFrameRetries())
 
         /// commandBufferCompleted(sampled:newest:) runs on Metal's completion thread when a pass ends,
         /// with the newest generation the pass sampled and the newest one published by then.
@@ -348,8 +376,6 @@ final class CanvasView: UIView {
                newest > sampled {
                 possibleTears.add(1, ordering: .relaxed)
             }
-
-            isCommandBufferInFlight.store(false, ordering: .releasing)
         }
     }
 
@@ -367,17 +393,33 @@ final class CanvasView: UIView {
         unsafeDowncast(layer, to: CAMetalLayer.self)
     }
 
-    /// init(frames:device:scrollProxy:) builds the pipeline and wires the sink's wake-up to this view.
-    /// `scrollProxy` is the invisible scroll view (see its doc); the tests pass a subclass.
+    /// init(frames:device:scrollProxy:) uses the dedicated acquisition queue for this canvas's layer.
+    convenience init(
+        frames     : FrameSink,
+        device     : some MTLDevice,
+        scrollProxy: UIScrollView = UIScrollView()
+    ) {
+        self.init(
+            frames             : frames,
+            device             : device,
+            scrollProxy        : scrollProxy,
+            makeDrawableSource : { DrawableAcquisitionQueue(layer: $0) }
+        )
+    }
+
+    /// init(frames:device:scrollProxy:makeDrawableSource:) builds the pipeline and wires the sink.
+    /// The factory receives the configured backing layer; tests can hold or fail its acquisitions.
+    /// `scrollProxy` is the invisible scroll view (see its doc); tests can pass a subclass.
     ///
     /// The pipeline is built here from the app's default library (Canvas.metal), once per view. If
     /// it does not build, the error is logged and the canvas only clears to the surround: the editor
     /// stays usable, and CanvasTextureTests fails on the same error. A device that cannot make a
     /// command queue is out of resources at launch, with nothing to degrade to.
-    init(
-        frames     : FrameSink,
-        device     : some MTLDevice,
-        scrollProxy: UIScrollView = UIScrollView()
+    init<Source: DrawableAcquiring>(
+        frames             : FrameSink,
+        device             : some MTLDevice,
+        scrollProxy        : UIScrollView = UIScrollView(),
+        makeDrawableSource : (CAMetalLayer) -> Source
     ) {
         guard let commandQueue = device.makeCommandQueue() else {
             fatalError("CanvasView: the device cannot make a command queue")
@@ -403,6 +445,7 @@ final class CanvasView: UIView {
         windowFloor = previewFloor
 
         configureLayer(device: device)
+        acquireNextDrawable = makeDrawableSource(metalLayer).acquire(completion:)
         configureRenderPass()
         configureGestures()
         configureAccessibility()
@@ -453,6 +496,7 @@ final class CanvasView: UIView {
     func resetZoom() {
         spring = nil
         canvasTransform.reset()
+        previewGeometry.reset()
         windowFloor = Self.newestGeneration(frames.published())
     }
 
@@ -523,11 +567,22 @@ final class CanvasView: UIView {
     /// setNeedsRedraw marks the canvas dirty: the next display link tick draws once, then the link
     /// pauses. Marks made before the next tick coalesce into that one draw.
     func setNeedsRedraw() {
+        hasDrawWaitingForGPU = hasDrawWaitingForGPU || drawableRequests.isRendering
         isDirty = true
-        displayLink?.isPaused = false
+        drawableRequests.markDirty()
+        drawableRetry?.cancel()
+        drawableRetry = nil
+        updateDisplayLink()
     }
 
     // MARK: - View lifecycle
+
+    /// willMove invalidates outstanding drawables before UIKit detaches or reparents the layer.
+    override func willMove(toWindow newWindow: UIWindow?) {
+        invalidateDrawableSurface(isAttached: false)
+        displayLink?.isPaused = true
+        super.willMove(toWindow: newWindow)
+    }
 
     /// didMoveToWindow owns the display link. It is invalidated on every move (a link left alive
     /// after the view leaves its window keeps running for nothing) and made again only when there
@@ -537,28 +592,32 @@ final class CanvasView: UIView {
 
         displayLink?.invalidate()
         displayLink = nil
+        invalidateDrawableSurface(isAttached: window != nil)
 
         guard let window else { return }
 
         contentScaleFactor = window.traitCollection.displayScale
         setNeedsLayout()
 
-        frameInterval          = 1 / Double(window.windowScene?.screen.maximumFramesPerSecond ?? 60)
+        let maximumRate = window.windowScene?.screen.maximumFramesPerSecond ?? 60
+        frameInterval          = 1 / Double(maximumRate)
         isLinkPausedOnLastTick = true
 
-        let link = CAMetalDisplayLink(metalLayer: metalLayer)
-        link.delegate                = self
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
-        // Asks for one frame of latency (default 2). On the iPad Air it changed neither the update's
-        // lead nor the presented times (33 ms from update to glass either way, F5) and dropped nothing.
-        link.preferredFrameLatency   = 1
-        link.isPaused                = !isDirty
+        let link = CADisplayLink(target: self, selector: #selector(displayLinkNeedsUpdate(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(
+            minimum   : Float(min(60, maximumRate)),
+            maximum   : Float(maximumRate),
+            preferred : Float(maximumRate)
+        )
+        link.isPaused = true
         link.add(to: .main, forMode: .common)
 
         displayLink = link
+        setNeedsRedraw()
     }
 
-    /// layoutSubviews sizes the drawable to the view in pixels; a new size needs one redraw.
+    /// layoutSubviews records the desired drawable size; a new size needs one redraw. The layer
+    /// receives that size only once any previous acquisition and GPU pass have returned.
     ///
     /// The comparison is against the last size laid out here, not `metalLayer.drawableSize`, so
     /// the redraw does not depend on whether CAMetalLayer ever resizes its drawable by itself.
@@ -566,39 +625,38 @@ final class CanvasView: UIView {
         super.layoutSubviews()
 
         let pixelSize = CGSize(
-            width  : bounds.width  * contentScaleFactor,
-            height : bounds.height * contentScaleFactor
+            width  : (bounds.width  * contentScaleFactor).rounded(.up),
+            height : (bounds.height * contentScaleFactor).rounded(.up)
         )
 
         guard pixelSize != laidOutSize else { return }
 
-        laidOutSize             = pixelSize
-        metalLayer.drawableSize = pixelSize
-        scrollProxy.frame       = bounds
+        laidOutSize       = pixelSize
+        scrollProxy.frame = bounds
+        invalidateDrawableSurface(isAttached: window != nil)
         setNeedsRedraw()
     }
 
     // MARK: - Drawing
 
-    /// displayLinkNeedsUpdate draws once if the view is dirty, then pauses the link. The link is a
-    /// CAMetalDisplayLink: it calls with a drawable already free, ahead of the frame it is for. A
-    /// CADisplayLink calling `nextDrawable` blocked main on the iPad 3.5 ms in every frame of an
-    /// animation, and a whole frame or two whenever the compositor held its drawables late.
-    ///
-    /// If the last command buffer is still on the GPU the update returns with the link running, so
-    /// the draw is retried on the next one: that is the one-pass-in-flight rule. `isDirty` is
-    /// cleared before `encodeFrame` reads the sink, so a frame published after that read marks the
-    /// view again and gets its own draw instead of being lost.
-    private func displayLinkNeedsUpdate(_ link: CAMetalDisplayLink, update: CAMetalDisplayLink.Update) {
+    /// displayLinkNeedsUpdate advances input animation at the screen's cadence. Acquiring a
+    /// drawable never waits on this run loop; the asynchronous handoff encodes the latest state.
+    @objc
+    private func displayLinkNeedsUpdate(_ link: CADisplayLink) {
         let recorder = InputRecorder.shared
         let began    = recorder.now
-        let outcome  = FrameTimingProbe.shared.measure("Tick") { drawIfDirty(link, update: update) }
+        isInsideDisplayTick = true
+        recordedTickDrawable = nil
+        let outcome  = FrameTimingProbe.shared.measure("Tick") {
+            drawIfDirty(link, recordedTick: began)
+        }
+        isInsideDisplayTick = false
 
         recorder.update(
             began          : began,
-            target         : update.targetPresentationTimestamp,
+            target         : link.targetTimestamp,
             zoom           : canvasTransform.zoom,
-            drawable       : outcome.drew ? update.drawable.drawableID : nil,
+            drawable       : recordedTickDrawable,
             windowInFlight : began > 0 && isWindowInFlight,
             proxy          : scrollProxy.contentOffset,
             offset         : canvasTransform.offset,
@@ -606,13 +664,13 @@ final class CanvasView: UIView {
         )
 
         FrameTimingProbe.shared.tick(
-            at          : update.targetPresentationTimestamp,
+            at          : link.targetTimestamp,
             isPaused    : link.isPaused,
-            skippedDraw : outcome.wantedDraw && !outcome.drew
+            skippedDraw : outcome.skippedForGPU
         )
-        wantedDrawOnLastTick = outcome.wantedDraw && !link.isPaused
+        wantedDrawOnLastTick = outcome.wantedDraw
 
-        let time = update.targetPresentationTimestamp
+        let time = link.targetTimestamp
 
         if !isLinkPausedOnLastTick {
             frameInterval = time - lastTickTime
@@ -622,40 +680,218 @@ final class CanvasView: UIView {
         isLinkPausedOnLastTick = link.isPaused
     }
 
-    /// drawIfDirty is the body of an update (see `displayLinkNeedsUpdate`). It returns whether the
-    /// view was dirty once the spring moved, and whether it drew (a pass still in flight skips it).
+    /// drawIfDirty advances animation and requests one draw of the latest state when needed.
     private func drawIfDirty(
-        _ link: CAMetalDisplayLink,
-        update: CAMetalDisplayLink.Update
-    ) -> (wantedDraw: Bool, drew: Bool) {
-        advanceSpring(to: update.targetPresentationTimestamp)
-        advanceZoomEasing(to: update.targetPresentationTimestamp)
+        _ link       : CADisplayLink,
+        recordedTick : CFTimeInterval
+    ) -> (wantedDraw: Bool, skippedForGPU: Bool) {
+        advanceSpring(to: link.targetTimestamp)
+        advanceZoomEasing(to: link.targetTimestamp)
         reportZoom()
         updateVisibleWindow(at: CACurrentMediaTime())
 
-        guard isDirty else {
-            link.isPaused = spring == nil && zoomEasing.isIdle && !isWindowUpdatePending
-            return (false, false)
+        let wanted         = isDirty
+        let skippedForGPU = wanted && drawableRequests.isRendering
+        let isAnimating    = spring != nil || !zoomEasing.isIdle
+        let isContinuation = hasDrawWaitingForGPU || (wantedDrawOnLastTick
+            && (isAnimating || link.targetTimestamp - lastTickTime <= frameInterval * 1.5))
+        if !wanted {
+            discardReadyDrawable()
+        }
+        if isDirty, let ready = readyDrawable {
+            readyDrawable = nil
+            if drawableRequests.beginRendering(ready.token) {
+                encodeReceivedDrawable(
+                    ready.result,
+                    token          : ready.token,
+                    recordedTick   : recordedTick,
+                    isContinuation : isContinuation
+                )
+            }
+        } else {
+            requestDrawableIfNeeded(recordedTick: recordedTick, isContinuation: isContinuation)
+        }
+        updateDisplayLink()
+        return (wanted, skippedForGPU)
+    }
+
+    /// updateDisplayLink sleeps during an acquisition or GPU pass unless animation still needs
+    /// ticks. A prepared drawable gets one tick to be consumed or discarded when input is idle.
+    private func updateDisplayLink() {
+        if !isDirty && !canAnticipateDraw {
+            discardReadyDrawable()
+        }
+        let canDraw = isDirty && (drawableRequests.canAcquire || readyDrawable != nil)
+            && laidOutSize.width > 0 && laidOutSize.height > 0
+        let needsTicks = spring != nil || !zoomEasing.isIdle || isWindowUpdatePending
+            || readyDrawable != nil
+        displayLink?.isPaused = window == nil || (!canDraw && !needsTicks)
+
+        if displayLink?.isPaused == true {
+            isLinkPausedOnLastTick = true
+        }
+    }
+
+    private func invalidateDrawableSurface(isAttached: Bool) {
+        discardReadyDrawable()
+        drawableRequests.invalidate(isAttached: isAttached)
+        wantedDrawOnLastTick = false
+        hasDrawWaitingForGPU = false
+        drawableRetry?.cancel()
+        drawableRetry = nil
+    }
+
+    /// discardReadyDrawable drops an unused drawable at idle or before changing the surface.
+    private func discardReadyDrawable() {
+        guard let ready = readyDrawable else { return }
+        readyDrawable = nil
+        drawableRequests.discardReady(ready.token)
+    }
+
+    /// requestDrawableIfNeeded reserves the whole acquisition and GPU pass before leaving main.
+    /// Resizing happens only here, when no previous call or pass still owns the layer's drawable.
+    private func requestDrawableIfNeeded(
+        recordedTick   : CFTimeInterval,
+        isContinuation : Bool,
+        isAhead        : Bool = false
+    ) {
+        guard isDirty || isAhead,
+              laidOutSize.width > 0,
+              laidOutSize.height > 0,
+              let acquireNextDrawable,
+              let token = drawableRequests.beginAcquisition()
+        else { return }
+
+        let size = laidOutSize
+        if !isAhead {
+            hasDrawWaitingForGPU = false
+        }
+        if metalLayer.drawableSize != size {
+            metalLayer.drawableSize = size
+        }
+        acquireNextDrawable { [weak self] result in
+            self?.receivedDrawable(
+                result,
+                token          : token,
+                size           : size,
+                recordedTick   : recordedTick,
+                isContinuation : isContinuation,
+                isAhead        : isAhead
+            )
+        }
+    }
+
+    /// receivedDrawable rejects an old surface. An ahead acquisition waits for the next dirty
+    /// CAD tick, which samples the latest transform before encoding. An ordinary acquisition
+    /// completes the draw already requested by its tick.
+    private func receivedDrawable(
+        _ result       : AcquiredDrawable?,
+        token          : DrawableRequestState.Token,
+        size           : CGSize,
+        recordedTick   : CFTimeInterval,
+        isContinuation : Bool,
+        isAhead        : Bool
+    ) {
+        guard drawableRequests.receive(token, hasDrawable: result != nil, waitForTick: isAhead),
+              let result else {
+            scheduleDrawableRetry()
+            updateDisplayLink()
+            return
         }
 
-        let claimed = crossThread.isCommandBufferInFlight.compareExchange(
-            expected : false,
-            desired  : true,
-            ordering : .acquiring
+        let drawable = result.drawable
+        guard window != nil,
+              size == laidOutSize,
+              drawable.texture.width == Int(size.width),
+              drawable.texture.height == Int(size.height)
+        else {
+            if isAhead {
+                drawableRequests.discardReady(token)
+            } else {
+                drawableRequests.finish(token, succeeded: false)
+                scheduleDrawableRetry()
+            }
+            updateDisplayLink()
+            return
+        }
+
+        if isAhead {
+            readyDrawable = (result, token)
+            updateDisplayLink()
+            return
+        }
+        encodeReceivedDrawable(
+            result,
+            token          : token,
+            recordedTick   : recordedTick,
+            isContinuation : isContinuation
         )
+    }
 
-        guard claimed.exchanged else { return (true, false) }
-
+    /// encodeReceivedDrawable uses only the latest transform and frame. Dirty is cleared before
+    /// reading the sink, so a later publication schedules another draw. InputRecorder associates
+    /// inline encoding with the current tick and asynchronous encoding with the tick that waited.
+    private func encodeReceivedDrawable(
+        _ result       : AcquiredDrawable,
+        token          : DrawableRequestState.Token,
+        recordedTick   : CFTimeInterval,
+        isContinuation : Bool
+    ) {
+        let drawable = result.drawable
+        hasDrawWaitingForGPU = false
         isDirty = false
-
-        let isEncoded = encodeFrame(into: update.drawable)
-
-        if !isEncoded {
-            crossThread.isCommandBufferInFlight.store(false, ordering: .releasing)
+        let began   = InputRecorder.shared.now
+        let encoded = FrameTimingProbe.shared.measure("Encode") {
+            encodeFrame(into: drawable, token: token, isContinuation: isContinuation)
         }
 
-        link.isPaused = !isDirty && spring == nil && zoomEasing.isIdle && !isWindowUpdatePending
-        return (true, isEncoded)
+        if encoded, isInsideDisplayTick {
+            recordedTickDrawable = drawable.drawableID
+        } else if encoded {
+            InputRecorder.shared.encoded(
+                drawable     : drawable.drawableID,
+                updateBegan  : recordedTick,
+                encodeBegan  : began,
+                zoom         : canvasTransform.zoom,
+                offset       : canvasTransform.offset
+            )
+        } else {
+            isDirty = true
+            drawableRequests.finish(token, succeeded: false)
+            scheduleDrawableRetry()
+        }
+        updateDisplayLink()
+    }
+
+    /// scheduleDrawableRetry gives transient failures a finite recovery window, even after the
+    /// last input. Cancellation and the state token both reject old windows and superseded demand.
+    private func scheduleDrawableRetry() {
+        guard isDirty || isAnimatingTransform,
+              let retry = drawableRequests.retry else { return }
+
+        drawableRetry?.cancel()
+        drawableRetry = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(retry.delay))
+            } catch {
+                return
+            }
+            guard let self, self.drawableRequests.resumeRetry(retry) else { return }
+
+            self.drawableRetry = nil
+            self.updateDisplayLink()
+        }
+    }
+
+    /// completedFrame releases the reservation on main, then prepares one drawable if input or
+    /// animation is still active. Otherwise it only wakes demand coalesced during the GPU pass.
+    private func completedFrame(_ token: DrawableRequestState.Token) {
+        guard drawableRequests.finish(token) else { return }
+
+        if canAnticipateDraw {
+            requestDrawableIfNeeded(recordedTick: 0, isContinuation: false, isAhead: true)
+        }
+        updateDisplayLink()
     }
 
     /// encodeFrame clears `drawable` and draws the sink's newest preview into it, then the window
@@ -665,7 +901,11 @@ final class CanvasView: UIView {
     /// `frames.published()` is read exactly once, here, and the textures and the tear check come
     /// from that one snapshot, so the pass never mixes the geometry of one frame with another.
     // any: Metal vends drawables only as protocol existentials.
-    private func encodeFrame(into drawable: any CAMetalDrawable) -> Bool {
+    private func encodeFrame(
+        into drawable  : any CAMetalDrawable,
+        token          : DrawableRequestState.Token,
+        isContinuation : Bool
+    ) -> Bool {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return false }
 
         let published = frames.published()
@@ -681,14 +921,14 @@ final class CanvasView: UIView {
         var sampledFrame : ReadyFrame? = nil
         var sampledWindow: ReadyFrame? = nil
 
-        if let frame, !frame.isDraft {
-            lastFullFrameSize = CGSize(width: frame.width, height: frame.height)
+        if let frame {
+            previewGeometry.observe(frame)
         }
 
         if let frame, let pipeline, let texture = texture(for: frame) {
             let quad    = canvasTransform.quad(
                 viewSize  : bounds.size,
-                imageSize : CGSize(width: frame.width, height: frame.height)
+                imageSize : frame.displaySize
             )
             let percent = zoomScale?.percent(forZoom: canvasTransform.zoom) ?? 0
 
@@ -706,13 +946,18 @@ final class CanvasView: UIView {
                isShowable(window),
                let windowTexture = self.texture(for: window) {
                 let windowQuad   = placement.quad(in: quad)
-                let isOneToOne   = abs(percent - 100) <= 100 * FrameWindow.realPixelsTolerance
+                let isOneToOne   = window.hasIdentityRaster
+                    && abs(percent - 100) <= 100 * FrameWindow.realPixelsTolerance
                 let drawableSize = SIMD2<Float>(Float(laidOutSize.width), Float(laidOutSize.height))
 
                 draw(
                     windowTexture,
                     in      : isOneToOne ? Self.pixelAligned(windowQuad, drawableSize: drawableSize) : windowQuad,
-                    style   : windowStyle(for: placement, percent: percent),
+                    style   : windowStyle(
+                        for      : window,
+                        placement: placement,
+                        percent  : percent
+                    ),
                     encoder : encoder
                 )
                 sampledWindow = window
@@ -730,10 +975,13 @@ final class CanvasView: UIView {
             drawable.addPresentedHandler(Self.presentedHandler(
                 generation       : sampledFrame.generation,
                 windowGeneration : sampledWindow?.generation,
-                isContinuation   : wantedDrawOnLastTick,
+                isContinuation   : isContinuation,
                 crossThread      : crossThread,
                 drawAgain        : { [weak self] in
-                    DispatchQueue.main.async { self?.setNeedsRedraw() }
+                    DispatchQueue.main.async {
+                        guard let self, self.drawableRequests.isCurrent(token) else { return }
+                        self.setNeedsRedraw()
+                    }
                 }
             ))
         }
@@ -758,11 +1006,12 @@ final class CanvasView: UIView {
         }
 
         commandBuffer.present(drawable)
-        commandBuffer.addCompletedHandler { [crossThread, frames] _ in
+        commandBuffer.addCompletedHandler { [weak self, crossThread, frames] _ in
             crossThread.commandBufferCompleted(
                 sampled : sampledGeneration,
                 newest  : Self.newestGeneration(frames.published())
             )
+            DispatchQueue.main.async { self?.completedFrame(token) }
         }
         commandBuffer.commit()
 
@@ -799,14 +1048,20 @@ final class CanvasView: UIView {
         )
     }
 
-    /// windowStyle samples a window nearest-neighbour from 100 % (its pixels are the photo's then:
-    /// one per screen pixel at 100 %, squares above) and bilinearly below, with the grid on its
-    /// pixels from `gridPercent`. A zoom within FrameWindow.realPixelsTolerance of 100 % counts.
-    private func windowStyle(for placement: FrameWindow, percent: Double) -> CanvasStyle {
-        CanvasStyle(
+    /// windowStyle uses nearest sampling at native zoom only for an identity raster. Reduced
+    /// drafts stay bilinear; their grid still follows the logical photo pixels.
+    private func windowStyle(
+        for frame: ReadyFrame,
+        placement: FrameWindow,
+        percent  : Double
+    ) -> CanvasStyle {
+        let usesNearest = frame.hasIdentityRaster
+            && percent >= 100 * (1 - FrameWindow.realPixelsTolerance)
+
+        return CanvasStyle(
             gridSize    : SIMD2<Float>(Float(placement.width), Float(placement.height)),
             gridOpacity : percent >= Self.gridPercent ? Self.gridOpacity : 0,
-            nearest     : percent >= 100 * (1 - FrameWindow.realPixelsTolerance) ? 1 : 0,
+            nearest     : usesNearest ? 1 : 0,
             clipping    : clippingOverlay.rawValue
         )
     }
@@ -1253,13 +1508,7 @@ final class CanvasView: UIView {
     /// imageSize is the size of the photo on screen, in preview pixels: the last full frame's,
     /// because drafts may be smaller, or the newest frame's before any full frame arrived.
     private var imageSize: CGSize {
-        if lastFullFrameSize != .zero {
-            return lastFullFrameSize
-        }
-
-        guard let frame = frames.latest() else { return .zero }
-
-        return CGSize(width: frame.width, height: frame.height)
+        previewGeometry.imageSize(for: frames.latest())
     }
 
     /// restingTransform is where the canvas is going: the running spring's target, or the current one.
@@ -1750,14 +1999,6 @@ final class CanvasView: UIView {
                 self?.setNeedsRedraw()
             }
         }
-    }
-}
-
-extension CanvasView: @preconcurrency CAMetalDisplayLinkDelegate {
-
-    // The link is added to the main run loop, so it always calls on main.
-    func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
-        displayLinkNeedsUpdate(link, update: update)
     }
 }
 

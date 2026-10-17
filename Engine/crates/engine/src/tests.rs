@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: verify exclusive CPU or GPU source accounting; see Engine/CHANGES.md.
 use serde_json::{Value, json};
 
 use crate::{Session, command_specs};
@@ -250,8 +251,11 @@ fn memory_report_counts_decoded_sources_and_renders() {
     s.render_now(id, 800, 600).unwrap();
     let m = s.memory_report();
     assert_eq!(m.preview_sources.count, 1);
-    // a 2560 px linear float source: 12 bytes per pixel
-    assert!(m.preview_sources.bytes >= 12 * 2560 * 1000, "{:?}", m.preview_sources);
+    // The 2560 px source has one owner: CPU before promotion, GPU afterward.
+    let source = m.preview_residency;
+    assert!(source.cpu_pixels + source.gpu_pixels >= 12 * 2560 * 1000, "{source:?}");
+    assert!(source.cpu_pixels == 0 || source.gpu_pixels == 0, "{source:?}");
+    assert_eq!(source.recovery_pixels, 0);
     assert_eq!(m.engine_bytes, m.thumb_sources.bytes + m.preview_sources.bytes + m.full_source.bytes + m.rendered.bytes);
     let r = s.thumb_job(id, 200).unwrap().run();
     s.accept(&r);

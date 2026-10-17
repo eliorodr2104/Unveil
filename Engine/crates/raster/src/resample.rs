@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): preserve owned storage when fitting needs no resize.
 //! Separable resampling with precomputed filter weights.
 
 use crate::{Image, par_rows};
@@ -118,10 +119,13 @@ impl Pixel for [f32; 4] {
 pub fn resize<T: Pixel>(img: &Image<T>, w: usize, h: usize, filter: Filter) -> Image<T> {
     let (w, h) = (w.max(1), h.max(1));
     if img.width == w && img.height == h {
-        return img.clone();
+        let cloned = img.clone();
+        crate::memory_trace::Allocation::of("resize-identity", &cloned.data).handoff();
+        return cloned;
     }
     let wx = weights(img.width, w, filter);
     let mut tmp = Image::<T>::new(w, img.height);
+    let tmp_memory = crate::memory_trace::Allocation::of("resize-horizontal", &tmp.data);
     par_rows(&mut tmp.data, w, |y, row| {
         let src = img.row(y);
         for (x, o) in row.iter_mut().enumerate() {
@@ -135,6 +139,7 @@ pub fn resize<T: Pixel>(img: &Image<T>, w: usize, h: usize, filter: Filter) -> I
     });
     let wy = weights(img.height, h, filter);
     let mut out = Image::<T>::new(w, h);
+    let output_memory = crate::memory_trace::Allocation::of("resize-output", &out.data);
     par_rows(&mut out.data, w, |y, row| {
         let (lo, ws) = &wy[y];
         for (k, wt) in ws.iter().enumerate() {
@@ -144,6 +149,9 @@ pub fn resize<T: Pixel>(img: &Image<T>, w: usize, h: usize, filter: Filter) -> I
             }
         }
     });
+    drop(tmp);
+    drop(tmp_memory);
+    output_memory.handoff();
     out
 }
 
@@ -153,6 +161,12 @@ pub fn fit<T: Pixel>(img: &Image<T>, max_w: usize, max_h: usize, filter: Filter)
     let w = ((img.width as f64 * s).round() as usize).max(1);
     let h = ((img.height as f64 * s).round() as usize).max(1);
     resize(img, w, h, filter)
+}
+
+/// Fit an owned image, retaining its allocation when it already has the required dimensions.
+/// Resized and degenerate images follow exactly the same filter and rounding path as [`fit`].
+pub fn fit_owned<T: Pixel>(img: Image<T>, max_w: usize, max_h: usize, filter: Filter) -> Image<T> {
+    if img.width > 0 && img.height > 0 && img.width <= max_w && img.height <= max_h { img } else { fit(&img, max_w, max_h, filter) }
 }
 
 /// 2× box downsample (pyramid level).
@@ -176,6 +190,30 @@ pub fn half<T: Pixel>(img: &Image<T>) -> Image<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fitting_owned_pixels_keeps_the_allocation_when_no_resize_is_needed() {
+        for (max_w, max_h) in [(37, 21), (1000, 1000)] {
+            let image = Image::<[f32; 3]>::from_fn(37, 21, |x, y| [x as f32, y as f32, 0.25]);
+            let address = image.data.as_ptr();
+            let expected = image.clone();
+            let result = fit_owned(image, max_w, max_h, Filter::Box);
+            assert_eq!(result, expected);
+            assert_eq!(result.data.as_ptr(), address);
+        }
+    }
+
+    #[test]
+    fn fitting_owned_pixels_preserves_resampling_and_empty_image_behavior() {
+        for (w, h) in [(37, 21), (21, 37), (0, 0)] {
+            let image = Image::<[f32; 3]>::from_fn(w, h, |x, y| [x as f32, y as f32, 0.25]);
+            for filter in [Filter::Box, Filter::Bilinear, Filter::Mitchell, Filter::Lanczos3] {
+                for (max_w, max_h) in [(11, 5), (0, 0), (100, 100)] {
+                    assert_eq!(fit_owned(image.clone(), max_w, max_h, filter), fit(&image, max_w, max_h, filter));
+                }
+            }
+        }
+    }
 
     #[test]
     fn constant_image_stays_constant() {

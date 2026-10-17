@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! The denoised picture as cached data, and the blend the Amount slider controls.
 //!
 //! A product is camera RGB at the sensor's resolution (what the model gave, before the raw's own opcodes and
@@ -305,7 +306,7 @@ pub fn read_window(path: &Path, key: &str, window: Option<Window>, factor: usize
     }
     // the picture rows and columns the blocks cover
     let (x_end, y_end) = if whole { (w.x + w.width, w.y + w.height) } else { (w.x + ow * factor, w.y + oh * factor) };
-    let mut out = Rgb32f { width: ow, height: oh, data: allocate(ow * oh, [0.0; 3])? };
+    let mut out = Rgb32f { width: ow, height: oh, data: allocate(ow * oh, [0.0; 3])?.into() };
     let lut = f16_table();
     let value = |raw: &[u8], c: usize, n: usize, i: usize| -> f32 {
         let (lo, hi) = (raw.get(2 * c * n + i).copied().unwrap_or(0), raw.get((2 * c + 1) * n + i).copied().unwrap_or(0));
@@ -476,7 +477,7 @@ mod tests {
     /// What binning a window of `img` by `k` means, written the slow obvious way.
     fn blocks(img: &Rgb32f, win: Window, k: usize, clip: Option<f32>) -> Rgb32f {
         let (ow, oh) = (win.width / k, win.height / k);
-        let mut out = Rgb32f { width: ow, height: oh, data: vec![[0.0; 3]; ow * oh] };
+        let mut out = Rgb32f { width: ow, height: oh, data: vec![[0.0; 3]; ow * oh].into() };
         for by in 0..oh {
             for bx in 0..ow {
                 for c in 0..3 {
@@ -591,20 +592,20 @@ mod tests {
     #[test]
     fn writing_rejects_unusable_pictures() {
         let p = temp("bad");
-        assert!(write(&p, &Rgb32f { width: 0, height: 0, data: vec![] }, "k").is_err());
-        assert!(write(&p, &Rgb32f { width: 3, height: 3, data: vec![[0.0; 3]; 8] }, "k").is_err());
+        assert!(write(&p, &Rgb32f { width: 0, height: 0, data: vec![].into() }, "k").is_err());
+        assert!(write(&p, &Rgb32f { width: 3, height: 3, data: vec![[0.0; 3]; 8].into() }, "k").is_err());
         assert!(!p.exists());
     }
 
     #[test]
     fn blend_mixes_by_amount_and_rejects_other_sizes() {
-        let mut base = Rgb32f { width: 2, height: 1, data: vec![[0.0; 3], [1.0; 3]] };
-        let dn = Rgb32f { width: 2, height: 1, data: vec![[1.0; 3], [0.0; 3]] };
+        let mut base = Rgb32f { width: 2, height: 1, data: vec![[0.0; 3], [1.0; 3]].into() };
+        let dn = Rgb32f { width: 2, height: 1, data: vec![[1.0; 3], [0.0; 3]].into() };
         assert!(blend(&mut base, &dn, 0.25));
         assert_eq!(base.data, vec![[0.25; 3], [0.75; 3]]);
         assert!(blend(&mut base, &dn, f32::NAN));
         assert_eq!(base.data, vec![[0.25; 3], [0.75; 3]]);
-        assert!(!blend(&mut base, &Rgb32f { width: 1, height: 1, data: vec![[0.0; 3]] }, 1.0));
+        assert!(!blend(&mut base, &Rgb32f { width: 1, height: 1, data: vec![[0.0; 3]].into() }, 1.0));
         assert!(blend(&mut base, &dn, 1.0));
         assert_eq!(base.data, dn.data);
     }

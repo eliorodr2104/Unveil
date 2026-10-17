@@ -1,14 +1,18 @@
-//! Give memory the system allocator keeps after frees back to the operating system.
+//! Return disposable storage and free allocator pages to the operating system.
 //!
-//! macOS's allocator keeps freed large blocks mapped as "reusable": they no longer count in the
-//! process's memory footprint but stay in its resident size until the system runs short. After a
-//! raw decode (hundreds of MB of temporaries) that made the resident size climb towards the sum of
-//! everything ever decoded. `malloc_zone_pressure_relief` (libSystem) returns those pages now.
-//! Elsewhere (glibc, Windows) blocks this large are unmapped when freed: nothing to do.
+//! `Returnable` gives selected large buffers anonymous mappings on Apple platforms and unmaps
+//! them when their owner drops. Other layouts and platforms use the system allocator. This is
+//! a per-buffer choice, not a replacement for the process allocator.
 //!
-//! This is LightCraft's only crate allowed `unsafe` (one FFI call, in `macos`). Its API is safe,
-//! and on failure or on other platforms it simply releases nothing.
+//! `release_free_memory` separately asks the macOS allocator to return already-free pages.
+//! That best-effort request is a no-op on other platforms, including iOS. Unsafe OS operations
+//! stay in this crate behind safe storage and reclamation APIs.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+
+// Modified for Unveil (2026-10-17): selected decode buffers have their own returnable backing.
+mod returnable;
+pub use returnable::Returnable;
+pub type ReturnableVec<T> = allocator_api2::vec::Vec<T, Returnable>;
 
 /// Return free allocator pages to the system. Returns the number of bytes released (always 0 on
 /// platforms where freed large blocks are already unmapped). Safe to call at any time, from any

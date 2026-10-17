@@ -1,4 +1,5 @@
 //! RAW decoding for LightCraft.
+//! Modified for Unveil (2026-10-14): expose samples already read by a metadata probe for bounded reuse.
 //!
 //! - [`probe`] recognises raw containers; [`decode`] turns a file into a [`RawImage`] (sensor data + everything
 //!   needed to render it: CFA, black/white levels, active area, default crop, orientation, DNG colour tags,
@@ -34,6 +35,7 @@ pub mod highlight;
 #[cfg(feature = "jxl")]
 mod jxl;
 pub mod ljpeg;
+pub use lightcraft_raster::memory_trace;
 pub mod opcodes;
 mod preview;
 pub mod profile;
@@ -276,12 +278,20 @@ pub fn decode(bytes: &[u8]) -> Result<RawImage> {
 /// [`RawImage::info`] of the decoded image. Black and white levels are not included (some formats
 /// measure them from the samples).
 ///
-/// A few uncompressed vendor formats derive part of this from the samples themselves (Nikon
+/// A few vendor formats derive part of this from the samples themselves (Nikon
 /// NEF: optically masked trailing columns; Olympus ORF: the bit depth of 16-bit files, and the CFA
 /// phase of files without an Exif `CFAPattern`; Pentax PEF without crop tags: dark borders); for
-/// those the samples are read (unpacked, nothing to decompress) and dropped.
+/// those the samples are read and dropped. Nikon's reader also decompresses compressed NEFs.
 pub fn probe_info(bytes: &[u8]) -> Result<RawInfo> {
     decode_with(bytes, Mode::Header).map(RawImage::into_info)
+}
+
+/// Probe metadata and transfer any complete sensor image the vendor had to read to obtain it.
+/// Header-only readers still return no samples. A caller may retain the optional image for its
+/// next development; no additional decode is performed and no sample allocation is cloned.
+pub fn probe_with_samples(bytes: &[u8]) -> Result<(RawInfo, Option<RawImage>)> {
+    let raw = decode_with(bytes, Mode::Header)?;
+    if !raw.data.is_empty() && raw.validate().is_ok() { Ok((raw.info(), Some(raw))) } else { Ok((raw.into_info(), None)) }
 }
 
 /// How much of a file a decoder reads.
@@ -294,8 +304,30 @@ pub(crate) enum Mode {
     Header,
 }
 
+/// Validation-only dispatch counts. Nikon's metadata probe enters the same sample decoder as a
+/// full load. Other formats' header readers may inspect partial samples; those are not counted here.
+#[cfg(feature = "decode-counts")]
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeCounts {
+    pub sample_dispatches: u64,
+}
+
+#[cfg(feature = "decode-counts")]
+static SAMPLE_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot the full-sample decoder dispatches, including Nikon sample-reading metadata probes.
+#[cfg(feature = "decode-counts")]
+pub fn decode_counts() -> DecodeCounts {
+    DecodeCounts { sample_dispatches: SAMPLE_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed) }
+}
+
 fn decode_with(bytes: &[u8], mode: Mode) -> Result<RawImage> {
-    match probe(bytes).ok_or(RawError::NotRaw)? {
+    let format = probe(bytes).ok_or(RawError::NotRaw)?;
+    #[cfg(feature = "decode-counts")]
+    if mode == Mode::Full || matches!(format, RawFormat::Nef | RawFormat::Nrw) {
+        SAMPLE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    match format {
         RawFormat::Dng => dng::decode(bytes, mode),
         RawFormat::Cr2 => vendor::cr2::decode(bytes, mode),
         RawFormat::Cr3 => vendor::cr3::decode(bytes, mode),
@@ -565,7 +597,7 @@ pub struct Normalized {
     pub height: usize,
     pub cpp: usize,
     /// Nominal range [0, 1] (values may exceed 1 above white or be negative from noise).
-    pub data: Vec<f32>,
+    pub data: lightcraft_raster::Buffer<f32>,
     /// CFA anchored at (0, 0) of this buffer.
     pub cfa: Option<Cfa>,
 }
@@ -657,6 +689,7 @@ impl RawImage {
             opcodes::apply_list(&self.opcodes.list1, &mut v, self.width, self.height, cpp, self.cfa.as_ref(), 65535.0);
             Some(v)
         };
+        let _stage1_memory = stage1.as_ref().map(|v| memory_trace::Allocation::of("raw-opcodes", v));
         let src = |i: usize| match &stage1 {
             Some(v) => v[i],
             None => self.data.get(i),
@@ -667,7 +700,8 @@ impl RawImage {
                 if range > 0.0 { 1.0 / range } else { 1.0 }
             })
             .collect();
-        let mut out = vec![0f32; a.width * a.height * cpp];
+        let mut out = lightcraft_raster::Buffer::filled_returnable(a.width * a.height * cpp, 0f32);
+        let normalized_memory = memory_trace::Allocation::of("normalizing", &out);
         let row_len = a.width * cpp;
         use rayon::prelude::*;
         out.par_chunks_mut(row_len).enumerate().for_each(|(y, row)| {
@@ -682,6 +716,7 @@ impl RawImage {
         });
         let cfa = self.cfa.as_ref().map(|c| c.shifted(a.x, a.y));
         opcodes::apply_list(&self.opcodes.list2, &mut out, a.width, a.height, cpp, cfa.as_ref(), 1.0);
+        normalized_memory.handoff();
         Ok(Normalized { width: a.width, height: a.height, cpp, data: out, cfa })
     }
 
@@ -689,8 +724,10 @@ impl RawImage {
     /// The result is camera RGB (not white balanced), white level = 1.0, not oriented.
     pub fn develop(&self, method: Method) -> Result<Rgb32f> {
         let n = self.normalized()?;
+        let normalized_memory = memory_trace::Allocation::of("normalized", &n.data);
         let rgb = demosaic(&n, method);
         drop(n);
+        drop(normalized_memory);
         Ok(self.finish_demosaiced(rgb))
     }
 

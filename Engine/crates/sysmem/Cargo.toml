@@ -3,10 +3,10 @@ name = "lightcraft-sysmem"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "LightCraft sysmem (L0): returns freed allocator memory to the OS. The workspace's only crate allowed `unsafe` (one FFI call)."
+description = "LightCraft sysmem (L0): explicit returnable storage and free allocator page reclamation."
 
-# Opts out of the workspace lints only to keep `unsafe_code = "deny"` overridable for the single FFI
-# module below; every other crate root has `#![forbid(unsafe_code)]`. See AGENTS.md and craftrules
+# Opts out of the workspace lints to keep `unsafe_code = "deny"` overridable in the OS memory
+# modules; every other crate root has `#![forbid(unsafe_code)]`. See AGENTS.md and craftrules
 # standards/never-crash.md ("isolated helper library crate").
 [lints.rust]
 unsafe_code = "deny"
@@ -16,3 +16,6 @@ dbg_macro = "warn"
 todo = "warn"
 
 [dependencies]
+# Modified for Unveil (2026-10-17): an explicit allocator for disposable decode buffers.
+allocator-api2 = "0.2.21"
+libc = { workspace = true }

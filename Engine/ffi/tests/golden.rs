@@ -121,7 +121,9 @@ fn golden_mac_renders() {
         println!("skipped: UNVEIL_RAW_DIR not set");
         return;
     };
-    let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Baseline/golden/mac");
+    let out_dir = std::env::var_os("UNVEIL_GOLDEN_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Baseline/golden/mac"));
     std::fs::create_dir_all(&out_dir).unwrap();
     let mut raws: Vec<PathBuf> = std::fs::read_dir(&raw_dir)
         .unwrap()

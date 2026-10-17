@@ -113,6 +113,27 @@ struct SignpostsTests {
         #expect(options.startsHomeOnPhotos == false)
         #expect(options.startsHomeExpanded == false)
         #expect(options.recordInputSeconds == nil)
+        #expect(options.reportsDecodeMemory == false)
+        #expect(options.poolLimitBytes == nil)
+        #expect(options.disablesPoolIdle == false)
+        #expect(options.probesPool == false)
+        #expect(options.memoryCycles == 1)
+    }
+
+    @Test
+    func memoryComparisonOptionsAreExplicitAndRejectInvalidByteCounts() {
+        let options = MeasurementLaunchOptions(arguments: [
+            "-UnveilDecodeMemory", "-UnveilPoolBytes", "134217728", "-UnveilNoPoolIdle",
+            "-UnveilPoolProbe", "-UnveilMemoryCycles", "3",
+        ])
+        #expect(options.reportsDecodeMemory)
+        #expect(options.poolLimitBytes == 134_217_728)
+        #expect(options.disablesPoolIdle)
+        #expect(options.probesPool)
+        #expect(options.memoryCycles == 3)
+        for invalid in ["-1", "1.5", "inf", "18446744073709551616"] {
+            #expect(MeasurementLaunchOptions(arguments: ["-UnveilPoolBytes", invalid]).poolLimitBytes == nil)
+        }
     }
 
     @Test

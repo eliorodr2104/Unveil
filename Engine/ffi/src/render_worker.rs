@@ -28,7 +28,7 @@ pub(crate) struct RenderDone {
     pub generation: u64,
     pub draft: bool,
     pub photo: PhotoId,
-    pub result: Option<RenderResult>,
+    pub result: Option<RenderResult<lightcraft_gpu::DisplayImage>>,
     pub histogram: Option<RenderResult>,
     pub delivery: Delivery,
     pub callback: FrameCallback,
@@ -60,8 +60,17 @@ impl RenderWorker {
                     let (generation, photo) = (job.request_id, job.photo);
                     let category = Category::of(draft, delivery.placement.is_some());
                     let span = Span::start();
-                    let result = caught("render", || job.run());
+                    // Keep eligible GPU pixels mapped through the engine-thread frame callback.
+                    let result = caught("render", || job.run_for_display(true));
                     record(category, Part::Render, &span);
+                    if let Some(Ok(rendered)) = result.as_ref().map(|r| &r.rendered) {
+                        crate::diagnostics::record_output(
+                            category,
+                            rendered.image.is_mapped(),
+                            (rendered.image.width, rendered.image.height),
+                            rendered.display_size,
+                        );
+                    }
                     let span = Span::start();
                     let histogram = histogram_job.and_then(|job| caught("histogram render", || job.run()));
                     if histogram.is_some() {

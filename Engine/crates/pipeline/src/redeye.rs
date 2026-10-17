@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: exact planning without a retained CPU original; see Engine/CHANGES.md.
 //! Red eye and pet eye correction, in scene-linear light after white balance.
 //!
 //! The user draws an ellipse over the eye; inside it the pupil is found automatically on the
@@ -140,18 +141,23 @@ pub fn resolve(src: &Rgb32f, eyes: &[RedEye], orientation: Orientation, frame: &
     if eyes.is_empty() {
         return Vec::new();
     }
-    let to_out = frame.norm_to_out(w, h);
     eyes.iter()
         .map(|e| {
             let p = detect(src, orientation, frame.ow, frame.oh, e);
-            let r = (p.radius * (0.5 + e.pupil_size.clamp(0.0, 100.0) / 100.0)).min(e.rx.max(e.ry) * 1.1);
-            let c = to_out.apply(p.center);
-            let r_px = (r * ppl) as f32;
-            let catchlight =
-                e.catchlight.filter(|_| e.pet).map(|off| ((c.x + off.x * r * ppl) as f32, (c.y + off.y * r * ppl) as f32, (0.22 * r_px).max(0.5)));
-            EyeK { cx: c.x as f32, cy: c.y as f32, r: r_px.max(0.5), darken: (e.darken.clamp(0.0, 100.0) / 100.0) as f32, pet: e.pet, catchlight }
+            resolved_pupil(e, p, frame, w, h, ppl)
         })
         .collect()
+}
+
+/// Map one detected pupil into the current output without sampling the original again.
+pub(crate) fn resolved_pupil(e: &RedEye, p: Pupil, frame: &Frame, w: usize, h: usize, ppl: f64) -> EyeK {
+    let to_out = frame.norm_to_out(w, h);
+    let r = (p.radius * (0.5 + e.pupil_size.clamp(0.0, 100.0) / 100.0)).min(e.rx.max(e.ry) * 1.1);
+    let c = to_out.apply(p.center);
+    let r_px = (r * ppl) as f32;
+    let catchlight =
+        e.catchlight.filter(|_| e.pet).map(|off| ((c.x + off.x * r * ppl) as f32, (c.y + off.y * r * ppl) as f32, (0.22 * r_px).max(0.5)));
+    EyeK { cx: c.x as f32, cy: c.y as f32, r: r_px.max(0.5), darken: (e.darken.clamp(0.0, 100.0) / 100.0) as f32, pet: e.pet, catchlight }
 }
 
 /// One pixel (pixel centre `(x, y)` in output pixels) through every eye.

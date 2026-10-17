@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! Import → Move: files (and their sidecars) end up at the destination, and a source is removed
 //! only when its move fully succeeded. Temp dirs only.
 
@@ -18,7 +19,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 fn write_png(path: &Path, seed: u8) {
     let (w, h) = (40usize, 24usize);
     let data: Vec<[u8; 4]> = (0..w * h).map(|i| [(i % w * 5) as u8, (i / w * 7) as u8, seed, 255]).collect();
-    let img = lightcraft_raster::Rgba8 { width: w, height: h, data };
+    let img = lightcraft_raster::Rgba8 { width: w, height: h, data: lightcraft_raster::Buffer::Heap(data) };
     let bytes = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, bytes).unwrap();

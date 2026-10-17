@@ -191,6 +191,35 @@ nonisolated final class InputRecorder: Sendable {
         }
     }
 
+    /// encoded attaches an asynchronous draw to the tick that requested it. Only encoding time
+    /// counts as main work; the off-main drawable wait is excluded from updateTime.
+    func encoded(
+        drawable    : Int,
+        updateBegan : CFTimeInterval,
+        encodeBegan : CFTimeInterval,
+        zoom        : Double,
+        offset      : SIMD2<Double>
+    ) {
+        guard updateBegan > 0, encodeBegan > 0 else { return }
+
+        let end = CACurrentMediaTime()
+        state.withLock { current in
+            guard current.isRecording,
+                  let row = current.rows.lastIndex(where: {
+                      $0.kind == "frame" && $0.time == updateBegan - current.start
+                  })
+            else { return }
+
+            current.drawableRows[drawable] = row
+            current.rows[row].drawable = drawable
+            current.rows[row].drew = true
+            current.rows[row].zoom = zoom
+            current.rows[row].offsetX = offset.x
+            current.rows[row].offsetY = offset.y
+            current.rows[row].updateTime += end - encodeBegan
+        }
+    }
+
     /// presented fills in when the drawable `drawable` was presented (0: never shown). Any thread.
     func presented(drawable: Int, at time: CFTimeInterval) {
         state.withLock { current in
@@ -279,6 +308,15 @@ nonisolated final class InputRecorder: Sendable {
 
     @inline(__always)
     func presented(drawable: Int, at time: CFTimeInterval) {}
+
+    @inline(__always)
+    func encoded(
+        drawable    : Int,
+        updateBegan : CFTimeInterval,
+        encodeBegan : CFTimeInterval,
+        zoom        : Double,
+        offset      : SIMD2<Double>
+    ) {}
 }
 
 #endif

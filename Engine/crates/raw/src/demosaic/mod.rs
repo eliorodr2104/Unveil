@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! Demosaicing: CFA mosaic → camera RGB ([`Rgb32f`]), values as normalised (white = 1.0).
 //!
 //! Methods (all from published descriptions, see the README):
@@ -216,9 +217,9 @@ mod tests {
                 assert!(out.data.iter().all(|p| p.iter().all(|v| v.is_finite())));
             }
         }
-        let n = Normalized { width: 2, height: 1, cpp: 1, data: vec![0.2, 0.4], cfa: None };
+        let n = Normalized { width: 2, height: 1, cpp: 1, data: vec![0.2, 0.4].into(), cfa: None };
         assert_eq!(demosaic(&n, Method::Ahd).data, vec![[0.2; 3], [0.4; 3]]);
-        let n = Normalized { width: 1, height: 1, cpp: 3, data: vec![0.1, 0.2, 0.3], cfa: None };
+        let n = Normalized { width: 1, height: 1, cpp: 3, data: vec![0.1, 0.2, 0.3].into(), cfa: None };
         assert_eq!(demosaic(&n, Method::Ahd).data, vec![[0.1, 0.2, 0.3]]);
     }
 

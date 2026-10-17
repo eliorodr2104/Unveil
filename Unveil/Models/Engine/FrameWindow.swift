@@ -7,8 +7,8 @@ import CoreGraphics
 import Foundation
 
 /// FrameWindow is one window of the photo's frame rendered at a zoom: the frame is the whole photo
-/// scaled to `frameWidth x frameHeight` pixels, and the window is its `width x height` part at
-/// (`x`, `y`), in frame pixels, y down.
+/// scaled to `frameWidth x frameHeight` logical pixels, and the window is its `width x height`
+/// part at (`x`, `y`), y down. Physical draft samples may be fewer; they never change this coverage.
 ///
 /// The canvas asks for one (`visible`) when it shows the photo above the whole-frame preview's own
 /// resolution, so the part on screen is rendered from the photo's real pixels instead of an upscaled

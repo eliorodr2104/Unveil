@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! Shared tail of every decoder: interpret device samples (with ICC / container hints), linearize,
 //! split alpha, and optionally downscale in linear light.
 
@@ -249,7 +250,7 @@ fn device_samples(raw: &Raw, ch: usize, n_color: usize) -> Vec<f32> {
 }
 
 fn from_vec(w: usize, h: usize, data: Vec<[f32; 3]>) -> Rgb32f {
-    Rgb32f { width: w, height: h, data }
+    Rgb32f { width: w, height: h, data: data.into() }
 }
 
 fn rgb_or_gray(raw: &Raw, ch: usize, meta: &Meta, info: Option<&icc::IccInfo>, float: bool) -> (Rgb32f, SourceSpace) {

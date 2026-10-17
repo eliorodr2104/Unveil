@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: half storage with explicit f32 loads; see Engine/CHANGES.md.
 // Separable resample with precomputed taps (`lightcraft_raster::resample::weights`, uploaded):
 // table[3i..3i+3] = (first source index, tap count, weight offset), weights stored as f32 bits.
 // Bindings: src, table (u32), dst.
@@ -20,7 +21,7 @@ fn resize_h(@builtin(global_invocation_id) g: vec3<u32>) {
     for (var c = 0u; c < nc; c++) {
         var acc = 0.0;
         for (var k = 0u; k < cnt; k++) {
-            acc = acc + src[(y * sw + lo + k) * nc + c] * bitcast<f32>(table[off + k]);
+            acc = acc + load_src((y * sw + lo + k) * nc + c) * bitcast<f32>(table[off + k]);
         }
         dst[(y * dw + x) * nc + c] = acc;
     }
@@ -44,7 +45,7 @@ fn resize_v(@builtin(global_invocation_id) g: vec3<u32>) {
     for (var c = 0u; c < nc; c++) {
         var acc = 0.0;
         for (var k = 0u; k < cnt; k++) {
-            acc = acc + src[((lo + k) * w + x) * nc + c] * bitcast<f32>(table[off + k]);
+            acc = acc + load_src(((lo + k) * w + x) * nc + c) * bitcast<f32>(table[off + k]);
         }
         dst[(y * w + x) * nc + c] = acc;
     }

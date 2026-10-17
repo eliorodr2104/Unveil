@@ -1,3 +1,4 @@
+//! Modified for Unveil (2026-10-14): account for host pixels, device originals and bounded planner facts separately.
 //! Memory accounting: what each cache holds (`library.memory`, and `ui.inspect` → `memory` with the
 //! frontend's own caches added).
 //!
@@ -83,7 +84,13 @@ fn apply(b: usize) {
     if let Some(g) = GATE.get() {
         g.set_limit(b / 4);
     }
-    lightcraft_gpu::set_pool_limit((b / 8) as u64);
+    lightcraft_gpu::set_pool_limit(gpu_pool_share(b));
+}
+
+/// Keep the measured f32 window working set reusable, capped independently of device RAM.
+/// Idle reclamation belongs to the host; a smaller overall budget always takes precedence.
+pub fn gpu_pool_share(budget: usize) -> u64 {
+    (budget / 8).min(320 << 20) as u64
 }
 
 /// Share of the budget for the engine's caches.
@@ -219,6 +226,9 @@ pub struct MemoryReport {
     pub preview_sources: Usage,
     /// The last full-resolution original (exports, 1:1).
     pub full_source: Usage,
+    /// Source ownership at each level. GPU bytes also appear in `gpu.allocated`, never `engine_bytes`.
+    pub preview_residency: crate::media::SourceResidency,
+    pub full_residency: crate::media::SourceResidency,
     /// Rendered thumbnails and view renders (8-bit) in memory.
     pub rendered: Usage,
     /// Sum of the above.
@@ -250,7 +260,9 @@ pub fn set_release_hook(f: fn()) {
 /// import). No-op without a hook.
 pub fn release() {
     if let Some(f) = RELEASE.get() {
+        lightcraft_raster::memory_trace::checkpoint("allocator-relief-begin");
         f();
+        lightcraft_raster::memory_trace::checkpoint("allocator-relief-end");
     }
 }
 
@@ -280,6 +292,8 @@ impl crate::Session {
             thumb_sources,
             preview_sources,
             full_source,
+            preview_residency: self.media.residency(crate::media::SourceLevel::Preview),
+            full_residency: self.media.residency(crate::media::SourceLevel::Full),
             rendered,
             engine_bytes: thumb_sources.bytes + preview_sources.bytes + full_source.bytes + rendered.bytes,
             gpu: gpu_usage(),

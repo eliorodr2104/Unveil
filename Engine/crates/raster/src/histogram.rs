@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: sample borrowed RGBA views without an owned image; see Engine/CHANGES.md.
 //! Histograms of display-encoded images (what the Histogram panel shows).
 
 use serde::Serialize;
@@ -17,12 +18,18 @@ impl Histogram {
     pub const BINS: usize = 256;
 
     pub fn of_srgb8(img: &Rgba8) -> Histogram {
+        Self::of_srgb8_view(img.width, img.height, |x, y| img.get(x, y))
+    }
+
+    /// Sample a borrowed image or region without allocating an intermediate raster. `pixel` is
+    /// called only within the supplied dimensions; its origin is the region's own top-left corner.
+    pub fn of_srgb8_view(width: usize, height: usize, pixel: impl Fn(usize, usize) -> [u8; 4]) -> Histogram {
         let mut h = Histogram { r: vec![0; 256], g: vec![0; 256], b: vec![0; 256], luma: vec![0; 256], total: 0 };
         // Sample at most ~1 MP for speed.
-        let step = ((img.len() as f64 / 1_000_000.0).sqrt().ceil() as usize).max(1);
-        for y in (0..img.height).step_by(step) {
-            for x in (0..img.width).step_by(step) {
-                let p = img.get(x, y);
+        let step = ((width as f64 * height as f64 / 1_000_000.0).sqrt().ceil() as usize).max(1);
+        for y in (0..height).step_by(step) {
+            for x in (0..width).step_by(step) {
+                let p = pixel(x, y);
                 h.r[p[0] as usize] += 1;
                 h.g[p[1] as usize] += 1;
                 h.b[p[2] as usize] += 1;
@@ -83,5 +90,23 @@ mod tests {
         assert!((h.mean_luma() - 0.5).abs() < 1e-3);
         assert_eq!(h.percentile(0.25), 0.0);
         assert_eq!(h.percentile(0.75), 1.0);
+    }
+
+    #[test]
+    fn borrowed_region_matches_owned_crop_and_sampling_grid() {
+        let source = Rgba8::from_fn(2049, 1537, |x, y| [(x * 13 + y) as u8, (y * 17) as u8, (x ^ y) as u8, 255]);
+        for (x, y, w, h) in [(3, 5, 17, 11), (1, 1, 2048, 1536), (37, 19, 1001, 1001)] {
+            let expected = Histogram::of_srgb8(&source.crop(x, y, w, h));
+            let actual = Histogram::of_srgb8_view(w, h, |px, py| source.get(x + px, y + py));
+            assert_eq!(actual, expected, "region {x},{y} {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn empty_borrowed_view_never_reads_a_pixel() {
+        for (w, h) in [(0, 0), (0, 17), (19, 0)] {
+            let actual = Histogram::of_srgb8_view(w, h, |_, _| panic!("empty view sampled"));
+            assert_eq!(actual, Histogram::of_srgb8(&Rgba8::new(w, h)));
+        }
     }
 }

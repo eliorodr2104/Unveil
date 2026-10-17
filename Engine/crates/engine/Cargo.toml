@@ -43,6 +43,8 @@ lightcraft-segment = { workspace = true, optional = true }
 lightcraft-fetch = { workspace = true }
 
 [features]
+# Modified for Unveil (2026-10-14): validation only; ordinary engine defaults are unchanged.
+decode-counts = ["lightcraft-raw/decode-counts"]
 # AI masks with SAM 3 (Object / Describe). Off for the web and CLI builds.
 sam = ["dep:lightcraft-segment"]
 denoise = ["dep:lightcraft-denoise", "lightcraft-denoise/runtime", "lightcraft-gpu/denoise"]

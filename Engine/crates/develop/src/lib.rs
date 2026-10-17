@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: count non-As-Shot white balance as an edit; see Engine/CHANGES.md.
 //! The non-destructive edit model of LightCraft.
 //!
 //! [`DevelopSettings`] is the complete description of a photo's look: pure, serializable data.
@@ -60,7 +61,9 @@ impl DevelopSettings {
     pub fn is_unedited(&self) -> bool {
         let mut a = self.clone();
         let d = DevelopSettings::default();
-        a.wb = d.wb;
+        if a.wb.mode == WbMode::AsShot {
+            a.wb = d.wb;
+        }
         a == d
     }
 
@@ -188,6 +191,20 @@ mod tests {
         assert!(!s.is_unedited());
         s.reset_section(Section::Light);
         assert!(s.is_unedited());
+    }
+
+    #[test]
+    fn only_as_shot_white_balance_is_unedited() {
+        let mut settings = DevelopSettings::default();
+        settings.wb.temp = 5200.0;
+        settings.wb.tint = 4.0;
+        assert!(settings.is_unedited(), "stored As Shot values are not an edit");
+        for mode in WbMode::ALL.into_iter().filter(|mode| *mode != WbMode::AsShot) {
+            settings.wb = WhiteBalance { mode, ..WhiteBalance::default() };
+            assert!(!settings.is_unedited(), "{mode:?} is an edit even at the default temperature and tint");
+        }
+        settings.reset_section(Section::Color);
+        assert!(settings.is_unedited());
     }
 
     #[test]

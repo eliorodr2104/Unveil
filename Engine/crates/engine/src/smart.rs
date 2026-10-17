@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): memory ownership and reserve policy; see Engine/CHANGES.md.
 //! Smart previews: a compact proxy of each photo (its decoded preview-size source, about 1 MB)
 //! kept in the library, so photos stay editable — and exportable at proxy size — while their
 //! originals are offline (an unplugged drive). The proxy is the scene-linear source scaled into
@@ -44,7 +45,7 @@ pub fn encode(img: &Rgb32f, tone: Option<&CameraTone>) -> Result<Vec<u8>, String
             [e(c[0]), e(c[1]), e(c[2]), 255]
         })
         .collect();
-    let rgba = Rgba8 { width: img.width, height: img.height, data };
+    let rgba = Rgba8 { width: img.width, height: img.height, data: data.into() };
     let jpg = lightcraft_codecs::encode_jpeg(
         &lightcraft_codecs::EncodeImage::rgba8(&rgba),
         92,

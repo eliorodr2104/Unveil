@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): observe X-Trans scratch and output capacity.
 //! Demosaicing for non-Bayer patterns (Fujifilm X-Trans and others): our own edge-weighted colour-difference
 //! interpolation.
 //!
@@ -84,9 +85,9 @@ fn robust_mean(vals: &[f32]) -> f32 {
     s / ws
 }
 
-fn green(m: &Mosaic, off: &Offsets) -> Vec<f32> {
+fn green(m: &Mosaic, off: &Offsets) -> lightcraft_raster::Buffer<f32> {
     let (w, h) = (m.w, m.h);
-    let mut g = vec![0f32; w * h];
+    let mut g = lightcraft_raster::Buffer::filled_returnable(w * h, 0f32);
     par_rows(&mut g, w, |y, row| {
         let interior_y = y >= 2 && y + 2 < h;
         let yi = y as isize;
@@ -143,8 +144,10 @@ pub(crate) fn directional(m: &Mosaic) -> Rgb32f {
     let (w, h) = (m.w, m.h);
     let off = Offsets::new(m);
     let g = green(m, &off);
+    let green_memory = crate::memory_trace::Allocation::of("xtrans-green", &g);
     let gg = |x: isize, y: isize| g[super::reflect(y, h) * w + super::reflect(x, w)];
-    let mut out = Rgb32f::new(w, h);
+    let mut out = Rgb32f::new_returnable(w, h);
+    let output_memory = crate::memory_trace::Allocation::of("demosaic-output", &out.data);
     par_rows(&mut out.data, w, |y, row| {
         let interior_y = y >= 2 && y + 2 < h;
         let yi = y as isize;
@@ -199,6 +202,9 @@ pub(crate) fn directional(m: &Mosaic) -> Rgb32f {
             }
         }
     });
+    drop(g);
+    drop(green_memory);
+    output_memory.handoff();
     out
 }
 
@@ -211,7 +217,7 @@ mod tests {
     /// interior path must match it bit for bit.
     fn reference(m: &Mosaic) -> Rgb32f {
         let (w, h) = (m.w, m.h);
-        let mut g = vec![0f32; w * h];
+        let mut g = lightcraft_raster::Buffer::filled_returnable(w * h, 0f32);
         for y in 0..h as isize {
             for x in 0..w as isize {
                 let o = &mut g[y as usize * w + x as usize];

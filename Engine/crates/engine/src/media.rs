@@ -1,4 +1,4 @@
-// Modified by the Unveil authors, 2026: RENDER_CACHE_VERSION 17 for the camera tone fix; see Engine/CHANGES.md.
+// Modified by the Unveil authors, 2026: mapped output, source ownership, precision retry and reduced drafts; see Engine/CHANGES.md.
 //! Source proxies and render jobs.
 //!
 //! Sources are decoded (or generated) once per level and cached in memory LRUs: `Thumb` (≤ 512 px
@@ -27,7 +27,22 @@ use lightcraft_preview::{Hash128, Hasher128, Lru, PreviewCache};
 use lightcraft_raster::{Histogram, Rgb32f, Rgba8};
 use serde::{Deserialize, Serialize};
 
+mod resident;
+use lightcraft_pipeline::SourceId;
+use resident::{CachedSource, SourcePolicy};
+pub use resident::{ResidentSource, SourceResidency};
+
+#[cfg(test)]
+mod resident_tests;
+
+#[cfg(test)]
+mod draft_tests;
+
+#[cfg(test)]
+mod precision_tests;
+
 const SETTINGS_HASH_ENTRIES: usize = 1024;
+const SOURCE_POLICY_ENTRIES: usize = 1024;
 
 #[derive(Default)]
 struct SettingsHashes {
@@ -223,6 +238,13 @@ impl DecodedSource {
 #[derive(Clone)]
 pub enum SourceRef {
     Loaded(Box<DecodedSource>),
+    /// A host cache entry carries its identity and a reload recipe containing no source pixels.
+    CachedHost {
+        id: SourceId,
+        source: Box<DecodedSource>,
+        reload: Box<SourceRef>,
+    },
+    Resident(Arc<ResidentSource>),
     Demo {
         scene: Box<lightcraft_scenes::Scene>,
         max_edge: usize,
@@ -244,6 +266,19 @@ pub enum SourceRef {
 }
 
 impl SourceRef {
+    /// Pin recovery to the pixels actually decoded, without an offline substitution.
+    fn exact_reload(mut self, decoded: &DecodedSource) -> Self {
+        if let Self::File { fallback, .. } = &mut self {
+            let proxy = fallback.take();
+            if decoded.info.is_none()
+                && let Some(path) = proxy
+            {
+                return Self::Smart { path };
+            }
+        }
+        self
+    }
+
     pub fn load(&self) -> Result<Arc<Rgb32f>, String> {
         self.load_source().map(|s| s.image)
     }
@@ -251,6 +286,8 @@ impl SourceRef {
     pub fn load_source(&self) -> Result<DecodedSource, String> {
         let image = match self {
             SourceRef::Loaded(a) => return Ok((**a).clone()),
+            SourceRef::CachedHost { source, .. } => return Ok((**source).clone()),
+            SourceRef::Resident(source) => return source.recover().map(|r| r.decoded),
             SourceRef::Demo { scene, max_edge } => crate::demo::scene_pixels(scene, *max_edge),
             SourceRef::File { path, max_edge, loader, fallback, denoise } => {
                 let plain = || match loader {
@@ -308,9 +345,11 @@ pub struct MediaCache {
     /// Decoded thumbnail-level sources (LRU by bytes).
     thumbs: Lru<PhotoId, DecodedSource>,
     /// Decoded preview-level sources with their last use ([`lightcraft_preview::next_tick`]).
-    previews: Vec<(PhotoId, DecodedSource, u64)>,
+    previews: Vec<(PhotoId, CachedSource, u64)>,
     /// The last full-resolution original (exports; one at a time: ~300 MB at 24 MP).
-    full: Option<(PhotoId, DecodedSource, u64)>,
+    full: Option<(PhotoId, CachedSource, u64)>,
+    source_epochs: [u64; 3],
+    source_policies: HashMap<PhotoId, (Hash128, [Arc<SourcePolicy>; 3], u64)>,
     /// How many previews to keep (LRU).
     pub preview_capacity: usize,
     /// Bytes all decoded sources and rendered previews in memory may take together (the cache
@@ -387,6 +426,8 @@ impl Default for MediaCache {
             thumbs: Lru::new(THUMB_SOURCE_BYTES.min(budget)),
             previews: Vec::new(),
             full: None,
+            source_epochs: [0; 3],
+            source_policies: HashMap::new(),
             preview_capacity: 0,
             budget,
             file_loader: None,
@@ -428,7 +469,9 @@ impl MediaCache {
 
     /// Forget every decoded source (photo ids changed meaning, e.g. another library was opened).
     pub fn clear_sources(&mut self) {
+        self.source_epochs.iter_mut().for_each(|epoch| *epoch = epoch.wrapping_add(1));
         self.settings_hashes = SettingsHashes::default();
+        self.source_policies.clear();
         self.thumbs = Lru::new(THUMB_SOURCE_BYTES.min(self.budget));
         self.previews.clear();
         self.full = None;
@@ -450,7 +493,12 @@ impl MediaCache {
     /// Bytes held by decoded sources and rendered previews in memory.
     pub fn held(&self) -> usize {
         let (t, p, f) = self.usage();
-        t.bytes + p.bytes + f.bytes + self.rendered.mem_usage().1
+        t.bytes
+            + p.bytes
+            + f.bytes
+            + self.rendered.mem_usage().1
+            + self.residency(SourceLevel::Preview).gpu_pixels
+            + self.residency(SourceLevel::Full).gpu_pixels
     }
 
     /// Evict least recently used entries across the source caches and the rendered previews
@@ -469,8 +517,14 @@ impl MediaCache {
             let Some((tick, which)) = candidates.into_iter().flatten().min() else { break };
             let freed = match which {
                 0 => self.thumbs.pop_oldest(),
-                1 => self.previews.iter().position(|e| e.2 == tick).map(|i| self.previews.remove(i).1.bytes()),
-                2 => self.full.take().map(|e| e.1.bytes()),
+                1 => {
+                    self.invalidate_source_epoch(SourceLevel::Preview);
+                    self.previews.iter().position(|e| e.2 == tick).map(|i| self.previews.remove(i).1.bytes())
+                }
+                2 => {
+                    self.invalidate_source_epoch(SourceLevel::Full);
+                    self.full.take().map(|e| e.1.bytes())
+                }
                 _ => self.rendered.evict_oldest(),
             };
             match freed {
@@ -485,8 +539,21 @@ impl MediaCache {
     }
 
     fn get_source(&mut self, id: PhotoId, level: SourceLevel) -> Option<DecodedSource> {
+        match self.get_cached(id, level)? {
+            CachedSource::Host { source, .. } => Some(source),
+            CachedSource::Device(source) => {
+                let recovered = source.recover().ok()?;
+                if !recovered.kind.reuses_device() {
+                    self.insert_source(id, level, recovered.decoded.clone());
+                }
+                Some(recovered.decoded)
+            }
+        }
+    }
+
+    fn get_cached(&mut self, id: PhotoId, level: SourceLevel) -> Option<CachedSource> {
         match level {
-            SourceLevel::Thumb => self.thumbs.get(&id).cloned(),
+            SourceLevel::Thumb => self.thumbs.get(&id).cloned().map(CachedSource::new),
             SourceLevel::Preview => self.previews.iter_mut().find(|e| e.0 == id).map(|e| {
                 e.2 = lightcraft_preview::next_tick();
                 e.1.clone()
@@ -501,17 +568,16 @@ impl MediaCache {
     /// The facts of photo `id`'s cached sources: the decoder's when one has them, else `header`
     /// (with a smart preview's stored camera tone curve).
     fn source_facts(&self, id: PhotoId, header: SourceInfo) -> SourceInfo {
-        let cached = || {
-            self.thumbs
-                .peek(&id)
-                .into_iter()
-                .chain(self.previews.iter().filter(|e| e.0 == id).map(|e| &e.1))
-                .chain(self.full.iter().filter(|e| e.0 == id).map(|e| &e.1))
-        };
-        match cached().find(|s| s.info.is_some()).or_else(|| cached().next()) {
-            Some(s) => s.info_or(header),
-            None => header,
+        if let Some(source) = self.thumbs.peek(&id).filter(|source| source.info.is_some()) {
+            return source.info_or(header);
         }
+        let cached = || self.previews.iter().chain(self.full.iter()).filter(|entry| entry.0 == id);
+        cached()
+            .find(|entry| entry.1.has_info())
+            .or_else(|| cached().next())
+            .map(|entry| entry.1.info_or(header.clone()))
+            .or_else(|| self.thumbs.peek(&id).map(|source| source.info_or(header.clone())))
+            .unwrap_or(header)
     }
 
     pub fn insert(&mut self, id: PhotoId, level: SourceLevel, img: Arc<Rgb32f>) {
@@ -519,17 +585,32 @@ impl MediaCache {
     }
 
     fn insert_source(&mut self, id: PhotoId, level: SourceLevel, img: DecodedSource) {
+        self.insert_cached(id, level, CachedSource::new(img));
+    }
+
+    fn insert_cached(&mut self, id: PhotoId, level: SourceLevel, img: CachedSource) {
+        let previous = match level {
+            SourceLevel::Preview => self.previews.iter().find(|entry| entry.0 == id),
+            SourceLevel::Full => self.full.as_ref(),
+            SourceLevel::Thumb => None,
+        };
+        if previous.is_some_and(|entry| entry.0 != id || entry.1.id() != img.id()) {
+            self.invalidate_source_epoch(level);
+        }
         let tick = lightcraft_preview::next_tick();
         match level {
             SourceLevel::Thumb => {
-                let cost = img.bytes();
-                self.thumbs.insert(id, img, cost);
+                if let Ok(source) = img.host() {
+                    let cost = source.bytes();
+                    self.thumbs.insert(id, source, cost);
+                }
             }
             SourceLevel::Preview => {
                 self.previews.retain(|e| e.0 != id);
                 self.previews.push((id, img, tick));
                 let cap = if self.preview_capacity == 0 { 4 } else { self.preview_capacity };
                 while self.previews.len() > cap {
+                    self.invalidate_source_epoch(SourceLevel::Preview);
                     let oldest = self.previews.iter().enumerate().min_by_key(|(_, e)| e.2).map(|(i, _)| i).unwrap_or(0);
                     self.previews.remove(oldest);
                 }
@@ -541,11 +622,74 @@ impl MediaCache {
 
     /// Forget a photo's decoded sources (e.g. after its file changed).
     pub fn forget(&mut self, id: PhotoId) {
+        self.source_epochs.iter_mut().for_each(|epoch| *epoch = epoch.wrapping_add(1));
+        self.source_policies.remove(&id);
         self.thumbs.remove(&id);
         self.previews.retain(|e| e.0 != id);
         if self.full.as_ref().is_some_and(|e| e.0 == id) {
             self.full = None;
         }
+    }
+
+    /// Retire the full original and any result started before this release; preview ownership stays.
+    pub fn release_full_source(&mut self) {
+        self.invalidate_source_epoch(SourceLevel::Full);
+        self.full = None;
+    }
+
+    /// Invalidate detached work before an eviction or replacement changes source ownership.
+    fn invalidate_source_epoch(&mut self, level: SourceLevel) {
+        self.source_epochs[level as usize] = self.source_epochs[level as usize].wrapping_add(1);
+    }
+
+    /// Drop device originals for suspension or pressure, and reject their older completions.
+    /// Host-only entries stay available; no GPU work or readback is needed to release ownership.
+    pub fn release_device_sources(&mut self) {
+        self.source_epochs.iter_mut().for_each(|epoch| *epoch = epoch.wrapping_add(1));
+        self.previews.retain(|entry| matches!(entry.1, CachedSource::Host { .. }));
+        if self.full.as_ref().is_some_and(|entry| matches!(entry.1, CachedSource::Device(_))) {
+            self.full = None;
+        }
+    }
+
+    pub fn source_epoch(&self, level: SourceLevel) -> u64 {
+        self.source_epochs[level as usize]
+    }
+
+    fn source_policy(&mut self, photo: &Photo, level: SourceLevel) -> Arc<SourcePolicy> {
+        let key = Hasher128::new().str(&content_key(photo)).finish();
+        if !self.source_policies.contains_key(&photo.id) && self.source_policies.len() >= SOURCE_POLICY_ENTRIES {
+            if let Some(oldest) = self.source_policies.iter().min_by_key(|(_, entry)| entry.2).map(|(id, _)| *id) {
+                self.source_policies.remove(&oldest);
+            }
+        }
+        let tick = lightcraft_preview::next_tick();
+        let entry = self.source_policies.entry(photo.id).or_insert_with(|| (key, std::array::from_fn(|_| Arc::new(SourcePolicy::new(key))), tick));
+        if entry.0 != key {
+            *entry = (key, std::array::from_fn(|_| Arc::new(SourcePolicy::new(key))), tick);
+        }
+        entry.2 = tick;
+        let active = match level {
+            SourceLevel::Preview => self.previews.iter().find(|entry| entry.0 == photo.id),
+            SourceLevel::Full => self.full.as_ref().filter(|entry| entry.0 == photo.id),
+            SourceLevel::Thumb => None,
+        };
+        if let Some((_, CachedSource::Device(source), _)) = active
+            && source.policy.content == Some(key)
+        {
+            entry.1[level as usize] = source.policy.clone();
+        }
+        entry.1[level as usize].clone()
+    }
+
+    pub fn residency(&self, level: SourceLevel) -> SourceResidency {
+        let mut usage = SourceResidency::default();
+        match level {
+            SourceLevel::Thumb => usage.cpu_pixels = self.thumbs.cost(),
+            SourceLevel::Preview => self.previews.iter().for_each(|entry| usage.add(entry.1.residency())),
+            SourceLevel::Full => self.full.iter().for_each(|entry| usage.add(entry.1.residency())),
+        }
+        usage
     }
 
     /// (decoded thumbnail sources, bytes).
@@ -565,8 +709,8 @@ impl MediaCache {
     /// Decoded sources held: (thumbnail level, preview level, full size).
     pub fn usage(&self) -> (crate::memory::Usage, crate::memory::Usage, crate::memory::Usage) {
         use crate::memory::Usage;
-        let previews = Usage::new(self.previews.len(), self.previews.iter().map(|e| e.1.bytes()).sum());
-        let full = self.full.as_ref().map(|e| Usage::new(1, e.1.bytes())).unwrap_or_default();
+        let previews = Usage::new(self.previews.len(), self.previews.iter().map(|e| e.1.cpu_bytes()).sum());
+        let full = self.full.as_ref().map(|e| Usage::new(1, e.1.cpu_bytes())).unwrap_or_default();
         (Usage::new(self.thumbs.len(), self.thumbs.cost()), previews, full)
     }
 
@@ -592,17 +736,27 @@ impl MediaCache {
     }
 
     fn source_ref_with(&mut self, p: &Photo, level: SourceLevel, cached: bool) -> SourceRef {
-        let mut r = self.source_ref_plain(p, level, cached);
+        if cached && let Some(source) = self.get_cached(p.id, level) {
+            return match source {
+                CachedSource::Host { id, source } => {
+                    let reload = if source.info.is_some() && matches!(p.source, Source::File { .. }) {
+                        self.origin_ref(&p.source, level.max_edge())
+                    } else {
+                        self.source_ref_with(p, level, false)
+                    };
+                    SourceRef::CachedHost { id, source: Box::new(source), reload: Box::new(reload) }
+                }
+                CachedSource::Device(source) => SourceRef::Resident(source),
+            };
+        }
+        let mut r = self.source_ref_plain(p, level);
         if let (SourceRef::File { denoise, .. }, Some((spec, loader))) = (&mut r, self.denoise.get(p.id)) {
             *denoise = Some((spec.clone(), loader.clone()));
         }
         r
     }
 
-    fn source_ref_plain(&mut self, p: &Photo, level: SourceLevel, cached: bool) -> SourceRef {
-        if cached && let Some(a) = self.get_source(p.id, level) {
-            return SourceRef::Loaded(Box::new(a));
-        }
+    fn source_ref_plain(&mut self, p: &Photo, level: SourceLevel) -> SourceRef {
         // Procedural scenes have a nominal size: "full" is that size, not unbounded.
         let max_edge = level.max_edge().min(match (&p.source, level) {
             (Source::Demo { .. }, SourceLevel::Full) => p.width.max(p.height).max(1) as usize,
@@ -656,6 +810,9 @@ pub struct RenderJob {
     pub cache_generation: u64,
     /// Content identity for validating a decoded source returned after a reload.
     pub source_key: Option<Hash128>,
+    /// Source-cache lifetime at this level, independent of semantic file content identity.
+    pub source_epoch: u64,
+    pub(crate) source_policy: Arc<SourcePolicy>,
     pub photo: PhotoId,
     pub level: SourceLevel,
     pub source: SourceRef,
@@ -676,15 +833,18 @@ pub struct RenderJob {
     pub view_cache: Option<(Arc<PreviewCache>, Hash128)>,
 }
 
-pub struct RenderResult {
+pub struct RenderResult<I = Rgba8> {
     pub request_id: u64,
     pub source_key: Option<Hash128>,
+    pub source_epoch: u64,
     pub photo: PhotoId,
     pub level: SourceLevel,
     pub key: u64,
-    pub rendered: Result<Rendered, String>,
+    pub rendered: Result<Rendered<I>, String>,
     /// A source that was loaded by this job (to be inserted into the cache).
     pub loaded: Option<DecodedSource>,
+    /// A successfully rendered device original, with no retained CPU RGB source.
+    pub resident: Option<Arc<ResidentSource>>,
     /// Set for a [`QuickJob`]'s stand-in: where the image came from.
     pub quick: Option<QuickSource>,
 }
@@ -696,6 +856,22 @@ impl RenderJob {
             self.request.quality = Quality::Draft;
             self.key ^= 0x9e37_79b9_7f4a_7c15;
         }
+        self
+    }
+
+    /// reduced_draft reuses native Full-quality stages and halves the encoded display output.
+    /// It preserves logical coverage and never enters persistent full-quality preview caches.
+    pub fn reduced_draft(mut self) -> Self {
+        if self.request.quality != Quality::Full {
+            self.request.quality = Quality::Full;
+            self.key ^= 0x9e37_79b9_7f4a_7c15;
+        }
+        if self.request.raster_scale != lightcraft_pipeline::RasterScale::Half {
+            self.request.raster_scale = lightcraft_pipeline::RasterScale::Half;
+            self.key ^= 0xd6e8_feb8_6659_fd93;
+        }
+        self.cache = None;
+        self.view_cache = None;
         self
     }
 
@@ -735,62 +911,179 @@ impl RenderJob {
     }
 
     pub fn run(self) -> RenderResult {
+        let result = self.run_output(false);
+        RenderResult {
+            request_id: result.request_id,
+            source_key: result.source_key,
+            source_epoch: result.source_epoch,
+            photo: result.photo,
+            level: result.level,
+            key: result.key,
+            rendered: result
+                .rendered
+                .and_then(|r| Ok(Rendered { display_size: r.display_size, image: r.image.into_owned()?, histogram: r.histogram, deep: r.deep })),
+            loaded: result.loaded,
+            resident: result.resident,
+            quick: result.quick,
+        }
+    }
+
+    /// Select owned pixels or retain completed GPU output until delivery. Mapping is opt-in:
+    /// device latency must be verified by the caller. Caches, overlays and CPU fallback stay owned.
+    pub fn run_for_display(self, retain_mapping: bool) -> RenderResult<lightcraft_gpu::DisplayImage> {
+        self.run_output(retain_mapping)
+    }
+
+    fn run_output(self, mapped: bool) -> RenderResult<lightcraft_gpu::DisplayImage> {
+        let done = |rendered, loaded, resident| RenderResult {
+            request_id: self.request_id,
+            source_key: self.source_key,
+            source_epoch: self.source_epoch,
+            photo: self.photo,
+            level: self.level,
+            key: self.key,
+            rendered,
+            loaded,
+            resident,
+            quick: None,
+        };
         if let Some((cache, key)) = &self.cache
             && let Some(img) = cache.get_at(self.cache_generation, *key)
         {
             let image = Arc::unwrap_or_clone(img);
             let histogram = Histogram::of_srgb8(&image);
-            return RenderResult {
-                request_id: self.request_id,
-                source_key: self.source_key,
-                photo: self.photo,
-                level: self.level,
-                key: self.key,
-                rendered: Ok(Rendered { image, histogram, deep: None }),
-                loaded: None,
-                quick: None,
-            };
+            return done(Ok(Rendered { display_size: (image.width, image.height), image: image.into(), histogram, deep: None }), None, None);
         }
-        let was_loaded = matches!(self.source, SourceRef::Loaded(_));
-        match self.source.load_source() {
-            Ok(source) => {
-                // the plain picture, or (Denoise amount above 0 and a denoised picture cached) the mix the amount asks for
-                let src = &source.image_for(self.settings.denoise_amount());
-                let info = source.info_or(self.info);
-                // Thumbnails (many small jobs side by side) stay on the CPU; views and exports use
-                // the GPU when there is one.
-                let gpu = self.cache.is_none();
-                let rendered = develop(src, &info, &self.settings, &self.request, self.stages.as_deref(), gpu);
-                if let Some((cache, key)) = &self.cache {
-                    cache.put_at(self.cache_generation, *key, Arc::new(rendered.image.clone()));
-                }
-                if let Some((cache, key)) = &self.view_cache
-                    && self.request.quality == Quality::Full
-                {
-                    cache.put_deferred_at(self.cache_generation, *key, Arc::new(rendered.image.clone()));
-                }
-                RenderResult {
-                    request_id: self.request_id,
-                    source_key: self.source_key,
-                    photo: self.photo,
-                    level: self.level,
-                    key: self.key,
-                    rendered: Ok(rendered),
-                    loaded: (!was_loaded).then_some(source),
-                    quick: None,
+        let gpu = self.cache.is_none();
+        let needs_view_cache = self.view_cache.is_some() && self.request.quality == Quality::Full;
+        let map_output = mapped && gpu && !needs_view_cache;
+        let stages = self.stages.as_deref();
+        let mut resident = None;
+        let mut loaded = None;
+        let mut recovered = None;
+        let rendered = if let SourceRef::Resident(source) = &self.source {
+            let output = gpu.then(|| source.render(&self.settings, &self.request, stages, map_output, &mut recovered)).flatten();
+            if let Some(output) = output {
+                resident = Some(source.clone());
+                output
+            } else {
+                let host = match recovered.map(Ok).unwrap_or_else(|| source.recover()) {
+                    Ok(host) => host,
+                    Err(error) => return done(Err(error), None, None),
+                };
+                let info = host.decoded.info_or(self.info.clone());
+                let retry = if gpu && source.needs_f32_retry() {
+                    let id = if host.kind == resident::RecoveryKind::Readback { source.id() } else { SourceId::new() };
+                    resident::promote(
+                        id,
+                        self.source_policy.clone(),
+                        &host.decoded,
+                        source.reload.clone(),
+                        info.clone(),
+                        &self.settings,
+                        &self.request,
+                        stages,
+                        map_output,
+                    )
+                } else {
+                    None
+                };
+                if let Some((output, device)) = retry {
+                    resident = Some(device);
+                    output
+                } else {
+                    let temporary = host.kind.reuses_device()
+                        && lightcraft_gpu::enabled()
+                        && resident::eligible(&self.settings, &self.request)
+                        && self.request.depth != lightcraft_pipeline::OutputDepth::U8;
+                    // High-depth exports borrow pixels once. Persistent CPU modes and failed GPU
+                    // frames keep the recovered host original so later frames do not recover again.
+                    if !temporary && let Some(stages) = stages {
+                        stages.clear();
+                    }
+                    let output = display_output(develop(&host.decoded.image, &info, &self.settings, &self.request, stages, false));
+                    if temporary {
+                        if let Some(stages) = stages {
+                            stages.clear_cpu();
+                        }
+                        resident = Some(source.clone());
+                    } else {
+                        loaded = Some(host.decoded);
+                    }
+                    output
                 }
             }
-            Err(e) => RenderResult {
-                request_id: self.request_id,
-                source_key: self.source_key,
-                photo: self.photo,
-                level: self.level,
-                key: self.key,
-                rendered: Err(e),
-                loaded: None,
-                quick: None,
-            },
-        }
+        } else {
+            let source = match self.source.load_source() {
+                Ok(source) => source,
+                Err(error) => return done(Err(error), None, None),
+            };
+            let info = source.info_or(self.info.clone());
+            let promotion = match &self.source {
+                SourceRef::CachedHost { id, reload, .. } => Some((*id, (**reload).clone())),
+                SourceRef::Loaded(_) => None, // no reload recipe was supplied by this caller
+                other => Some((SourceId::new(), other.clone())),
+            };
+            let promoted = if gpu && self.level != SourceLevel::Thumb {
+                match promotion {
+                    Some((id, reload)) => resident::promote_owned(
+                        id,
+                        self.source_policy.clone(),
+                        source,
+                        reload,
+                        info.clone(),
+                        &self.settings,
+                        &self.request,
+                        stages,
+                        map_output,
+                    ),
+                    None => resident::Promotion::Host(source),
+                }
+            } else {
+                resident::Promotion::Host(source)
+            };
+            match promoted {
+                resident::Promotion::Device(output, device) => {
+                    resident = Some(device);
+                    output
+                }
+                resident::Promotion::Failed(error) => return done(Err(error), None, None),
+                resident::Promotion::Host(source) => {
+                    let info = source.info_or(self.info.clone());
+                    let src = source.image_for(self.settings.denoise_amount());
+                    // The denoise pair remains a host source. Other failed promotions use exact CPU
+                    // fallback without issuing a second upload through the legacy GPU path.
+                    let legacy_gpu =
+                        gpu && (source.denoised.is_some() || self.level == SourceLevel::Thumb || matches!(self.source, SourceRef::Loaded(_)));
+                    let output = if map_output && legacy_gpu {
+                        develop_for_display(&src, &info, &self.settings, &self.request, stages)
+                    } else {
+                        display_output(develop(&src, &info, &self.settings, &self.request, stages, legacy_gpu))
+                    };
+                    if !matches!(self.source, SourceRef::Loaded(_) | SourceRef::CachedHost { .. }) {
+                        loaded = Some(source);
+                    }
+                    output
+                }
+            }
+        };
+        let rendered = if self.cache.is_some() || needs_view_cache {
+            match rendered.image.into_owned() {
+                Ok(image) => {
+                    if let Some((cache, key)) = &self.cache {
+                        cache.put_at(self.cache_generation, *key, Arc::new(image.clone()));
+                    }
+                    if needs_view_cache && let Some((cache, key)) = &self.view_cache {
+                        cache.put_deferred_at(self.cache_generation, *key, Arc::new(image.clone()));
+                    }
+                    Rendered { display_size: rendered.display_size, image: image.into(), histogram: rendered.histogram, deep: rendered.deep }
+                }
+                Err(error) => return done(Err(error), loaded, None),
+            }
+        } else {
+            rendered
+        };
+        done(Ok(rendered), loaded, resident)
     }
 }
 
@@ -811,6 +1104,27 @@ pub fn develop(src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &
         Some(st) => lightcraft_pipeline::render_cached(src, info, s, req, st),
         None => lightcraft_pipeline::render(src, info, s, req),
     }
+}
+
+fn display_output(rendered: Rendered) -> Rendered<lightcraft_gpu::DisplayImage> {
+    Rendered { display_size: rendered.display_size, image: rendered.image.into(), histogram: rendered.histogram, deep: rendered.deep }
+}
+
+fn develop_for_display(
+    src: &Arc<Rgb32f>,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    stages: Option<&StageCache>,
+) -> Rendered<lightcraft_gpu::DisplayImage> {
+    if !lightcraft_pipeline::lut::is_lut_profile(&s.profile.id)
+        && !s.masks.iter().any(|m| m.visible && m.refine > 0.0)
+        && req.proof.is_none()
+        && let Some(rendered) = lightcraft_gpu::render_mapped(src, info, s, req, stages)
+    {
+        return rendered;
+    }
+    display_output(develop(src, info, s, req, stages, false))
 }
 
 /// Where a [`QuickJob`]'s stand-in image came from.
@@ -847,16 +1161,18 @@ impl QuickJob {
         let done = |rendered: Result<Rendered, String>, quick| RenderResult {
             request_id,
             source_key: None,
+            source_epoch: 0,
             photo,
             level: SourceLevel::Thumb,
             key,
             rendered,
             loaded: None,
+            resident: None,
             quick,
         };
         let rendered = |image: Rgba8| {
             let histogram = Histogram::of_srgb8(&image);
-            Ok(Rendered { image, histogram, deep: None })
+            Ok(Rendered { display_size: (image.width, image.height), image, histogram, deep: None })
         };
         for (cache, k) in &self.cached {
             if let Some(img) = cache.get(*k) {
@@ -961,6 +1277,8 @@ impl crate::Session {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
             source_key: Some(source_key),
+            source_epoch: self.media.source_epoch(level),
+            source_policy: self.media.source_policy(&p, level),
             photo: id,
             level,
             source,
@@ -1011,6 +1329,8 @@ impl crate::Session {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
             source_key: Some(Hasher128::new().str(&content_key(&p)).finish()),
+            source_epoch: self.media.source_epoch(level),
+            source_policy: self.media.source_policy(&p, level),
             photo: id,
             level,
             source,
@@ -1056,6 +1376,8 @@ impl crate::Session {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
             source_key: Some(Hasher128::new().str(&content_key(&p)).finish()),
+            source_epoch: self.media.source_epoch(level),
+            source_policy: self.media.source_policy(&p, level),
             photo: id,
             level,
             source,
@@ -1204,12 +1526,19 @@ impl crate::Session {
         })
     }
 
-    /// Accept a finished job's loaded source into the cache.
-    pub fn accept(&mut self, r: &RenderResult) {
-        if let Some(src) = &r.loaded
-            && r.source_key.is_none_or(|key| self.catalog.photo(r.photo).is_some_and(|p| Hasher128::new().str(&content_key(p)).finish() == key))
+    /// Accept a source only while both its content and cache lifetime still match the job.
+    pub fn accept<I>(&mut self, r: &RenderResult<I>) {
+        if r.source_epoch != self.media.source_epoch(r.level)
+            || !r.source_key.is_none_or(|key| self.catalog.photo(r.photo).is_some_and(|p| Hasher128::new().str(&content_key(p)).finish() == key))
         {
-            self.media.insert_source(r.photo, r.level, src.clone());
+            return;
+        }
+        if r.rendered.is_ok()
+            && let Some(source) = &r.resident
+        {
+            self.media.insert_cached(r.photo, r.level, CachedSource::Device(source.clone()));
+        } else if let Some(source) = &r.loaded {
+            self.media.insert_source(r.photo, r.level, source.clone());
         }
     }
 
@@ -1270,9 +1599,20 @@ impl crate::Session {
     /// The source proxy for pixel-statistics commands (auto tone/WB), loading synchronously.
     pub fn source_now(&mut self, id: PhotoId, level: SourceLevel) -> Result<Arc<Rgb32f>, String> {
         let p = self.catalog.photo(id).ok_or("no such photo")?.clone();
-        let r = self.media.source_ref(&p, level).load_source()?;
-        let image = r.image.clone();
-        self.media.insert_source(id, level, r);
+        let source = self.media.source_ref(&p, level);
+        if let SourceRef::Resident(resident) = &source {
+            let recovered = resident.recover()?;
+            let image = recovered.decoded.image.clone();
+            if !recovered.kind.reuses_device() {
+                self.media.insert_source(id, level, recovered.decoded);
+            }
+            return Ok(image);
+        }
+        let decoded = source.load_source()?;
+        let image = decoded.image.clone();
+        if !matches!(source, SourceRef::CachedHost { .. }) {
+            self.media.insert_source(id, level, decoded);
+        }
         Ok(image)
     }
 }

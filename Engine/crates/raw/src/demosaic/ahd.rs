@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): write completed tiles into disjoint row bands; preserve halo and pixel arithmetic.
 //! Adaptive Homogeneity-Directed demosaicing (K. Hirakawa, T. W. Parks, "Adaptive homogeneity-directed
 //! demosaicing algorithm", IEEE Trans. Image Processing 14(3), 2005), implemented from the paper:
 //!
@@ -11,7 +12,7 @@
 //! Work is done in overlapping tiles (bounded memory, rayon-parallel).
 
 use super::Mosaic;
-use crate::Rgb32f;
+use crate::{Rgb32f, memory_trace::Allocation};
 use rayon::prelude::*;
 
 const TILE: usize = 128;
@@ -19,20 +20,23 @@ const MARGIN: usize = 6;
 
 pub(crate) fn ahd(m: &Mosaic) -> Rgb32f {
     let (w, h) = (m.w, m.h);
-    let tiles: Vec<(usize, usize)> = (0..h.div_ceil(TILE)).flat_map(|ty| (0..w.div_ceil(TILE)).map(move |tx| (tx * TILE, ty * TILE))).collect();
-    let results: Vec<(usize, usize, usize, usize, Vec<[f32; 3]>)> = tiles
-        .par_iter()
-        .map(|&(x0, y0)| {
-            let (tw, th) = (TILE.min(w - x0), TILE.min(h - y0));
-            (x0, y0, tw, th, tile(m, x0, y0, tw, th))
-        })
-        .collect();
-    let mut out = Rgb32f::new(w, h);
-    for (x0, y0, tw, th, px) in results {
-        for y in 0..th {
-            out.data[(y0 + y) * w + x0..(y0 + y) * w + x0 + tw].copy_from_slice(&px[y * tw..(y + 1) * tw]);
+    let mut out = Rgb32f::new_returnable(w, h);
+    let output_memory = Allocation::of("demosaic-output", &out.data);
+    out.data.par_chunks_mut(w * TILE).enumerate().for_each(|(band, rows)| {
+        let y0 = band * TILE;
+        let th = TILE.min(h - y0);
+        for x0 in (0..w).step_by(TILE) {
+            let tw = TILE.min(w - x0);
+            let px = tile(m, x0, y0, tw, th);
+            let memory = Allocation::of("ahd-tiles", &px);
+            for y in 0..th {
+                rows[y * w + x0..y * w + x0 + tw].copy_from_slice(&px[y * tw..(y + 1) * tw]);
+            }
+            drop(px);
+            drop(memory);
         }
-    }
+    });
+    output_memory.handoff();
     out
 }
 
@@ -55,7 +59,9 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize) -> Vec<[f32; 3]>
     let n = bw * bh;
     let (ox, oy) = (x0 as isize - MARGIN as isize, y0 as isize - MARGIN as isize);
     let mut mos = vec![0f32; n];
+    let _mos_memory = Allocation::of("ahd-scratch", &mos);
     let mut col = vec![0u8; n];
+    let _col_memory = Allocation::of("ahd-scratch", &col);
     for y in 0..bh {
         for x in 0..bw {
             mos[y * bw + x] = m.get(ox + x as isize, oy + y as isize);
@@ -65,7 +71,9 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize) -> Vec<[f32; 3]>
     let cl = |x: isize, y: isize| -> usize { y.clamp(0, bh as isize - 1) as usize * bw + x.clamp(0, bw as isize - 1) as usize };
     // 1. directional greens
     let mut gh = vec![0f32; n];
+    let _gh_memory = Allocation::of("ahd-scratch", &gh);
     let mut gv = vec![0f32; n];
+    let _gv_memory = Allocation::of("ahd-scratch", &gv);
     for y in 0..bh as isize {
         for x in 0..bw as isize {
             let i = cl(x, y);
@@ -111,14 +119,20 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize) -> Vec<[f32; 3]>
         rgb
     };
     let rh = complete(&gh);
+    let _rh_memory = Allocation::of("ahd-scratch", &rh);
     let rv = complete(&gv);
+    let _rv_memory = Allocation::of("ahd-scratch", &rv);
     // 3. Lab + homogeneity
     let lh: Vec<[f32; 3]> = rh.iter().map(|&p| lab(p)).collect();
+    let _lh_memory = Allocation::of("ahd-scratch", &lh);
     let lv: Vec<[f32; 3]> = rv.iter().map(|&p| lab(p)).collect();
+    let _lv_memory = Allocation::of("ahd-scratch", &lv);
     let dl = |a: &[f32; 3], b: &[f32; 3]| (a[0] - b[0]).abs();
     let dc = |a: &[f32; 3], b: &[f32; 3]| (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
     let mut hh = vec![0u8; n];
+    let _hh_memory = Allocation::of("ahd-scratch", &hh);
     let mut hv = vec![0u8; n];
+    let _hv_memory = Allocation::of("ahd-scratch", &hv);
     for y in 1..bh as isize - 1 {
         for x in 1..bw as isize - 1 {
             let i = cl(x, y);
@@ -162,4 +176,32 @@ fn tile(m: &Mosaic, x0: usize, y0: usize, tw: usize, th: usize) -> Vec<[f32; 3]>
         }
     }
     out
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn bands_match_independently_collected_tiles_at_every_edge_and_bayer_phase() {
+        for (w, h) in [(4, 4), (127, 129), (131, 259), (257, 128)] {
+            for pattern in ["RGGB", "BGGR", "GBRG", "GRBG"] {
+                let data: Vec<_> = (0..w * h).map(|i| (i * 73 % 1021) as f32 / 1020.0).collect();
+                let cfa = crate::Cfa::bayer(pattern).unwrap();
+                let m = Mosaic { w, h, data: &data, cfa: &cfa };
+                let mut expected = Rgb32f::new_returnable(w, h);
+                let tiles: Vec<_> = (0..h)
+                    .step_by(TILE)
+                    .flat_map(|y| (0..w).step_by(TILE).map(move |x| (x, y)))
+                    .map(|(x, y)| (x, y, TILE.min(w - x), TILE.min(h - y), tile(&m, x, y, TILE.min(w - x), TILE.min(h - y))))
+                    .collect();
+                for (x, y, tw, th, px) in tiles {
+                    for row in 0..th {
+                        expected.data[(y + row) * w + x..(y + row) * w + x + tw].copy_from_slice(&px[row * tw..(row + 1) * tw]);
+                    }
+                }
+                assert_eq!(ahd(&m), expected, "{pattern} {w}x{h}");
+            }
+        }
+    }
 }

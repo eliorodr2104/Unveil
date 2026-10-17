@@ -16,6 +16,7 @@ struct Shot {
     fallback: bool,
     width: u32,
     height: u32,
+    display: (u32, u32),
     frame_width: u32,
     frame_height: u32,
     x: u32,
@@ -57,6 +58,7 @@ extern "C" fn keep_shot(ctx: *mut std::ffi::c_void, frame: *const UVFrame) {
         fallback: f.fallback,
         width: f.width,
         height: f.height,
+        display: (f.display_width, f.display_height),
         frame_width: f.frame_width,
         frame_height: f.frame_height,
         x: f.x,
@@ -311,36 +313,141 @@ fn every_frame_carries_the_cropped_frame_at_the_photos_own_resolution() {
     assert!(part.frame_width == native_w && part.frame_height.abs_diff(native_h) <= 1);
 }
 
-/// A window of a source larger than a view's stages keep (96 MB) uses upstream's one shared device
-/// copy of it; uv_release_windows frees it, and the next window renders the same pixels again.
-/// Without a GPU there is no device copy, and it prints a skip note.
+/// Closing the zoom releases the full source owner; a later zoom reconstructs the same pixels.
 #[test]
-fn releasing_the_windows_frees_the_shared_source_and_the_next_window_renders_again() {
+fn releasing_the_windows_frees_the_resident_source_and_the_next_window_renders_again() {
     let shots = Arc::new(Shots::default());
     let s = TestSession::new();
-    // 4200 x 2400 linear RGB floats: 121 MB.
     import_png(&s, &gradient_png(s.dir.path(), "big.png", 4200, 2400));
     let win = [1000, 800, 512, 384];
     let first = shot_at(&shots, window(&s, &shots, (4200, 4200), win, false));
-    if lightcraft_gpu::shared_source_bytes() == 0 {
-        println!("skipped: the window did not render on the GPU");
-        return;
+    let before = exec_ok(&s, "library.memory", "{}");
+    let gpu_bytes = before["fullResidency"]["gpuPixels"].as_u64().unwrap();
+    assert!(
+        gpu_bytes > 0 || std::env::var_os("UNVEIL_REQUIRE_GPU").is_none(),
+        "window ownership test requires a GPU: {before}"
+    );
+    if gpu_bytes > 0 {
+        assert_eq!(before["fullResidency"]["cpuPixels"], 0);
     }
-
-    // SAFETY: s.raw is live for the whole test.
+    // SAFETY: s.raw is live, and the following command is ordered after the release message.
     unsafe { uv_release_windows(s.raw) };
-    let released = (0..250).any(|_| {
-        std::thread::sleep(Duration::from_millis(20));
-        lightcraft_gpu::shared_source_bytes() == 0
-    });
-    assert!(released, "the shared source survived the release");
-
+    let after = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(
+        after["fullSource"]["count"], 0,
+        "full original survived the release: {after}"
+    );
+    assert_eq!(after["fullResidency"]["gpuPixels"], 0);
     let second = shot_at(&shots, window(&s, &shots, (4200, 4200), win, false));
     assert!(second.window && second.rgba == first.rgba);
-    assert!(
-        lightcraft_gpu::shared_source_bytes() > 0,
-        "the window did not upload its source again"
+    let next = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(next["fullSource"]["count"], 1);
+    assert_eq!(next["fullResidency"]["gpuPixels"].as_u64().unwrap(), gpu_bytes);
+}
+
+#[test]
+fn releasing_windows_keeps_the_full_original_needed_by_a_tight_crop_preview() {
+    let shots = Arc::new(Shots::default());
+    let s = TestSession::new();
+    import_png(&s, &gradient_png(s.dir.path(), "tight.png", 1200, 800));
+    exec_ok(
+        &s,
+        "develop.merge",
+        r#"{"settings":{"crop":{"geometry":{"rect":{"x0":0.35,"y0":0.35,"x1":0.65,"y1":0.65},"angle":0}}}}"#,
     );
+    let first = shot_at(&shots, preview(&s, &shots, 1280, false));
+    let before = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(
+        before["fullSource"]["count"], 1,
+        "fit preview must select Full for this crop"
+    );
+    // SAFETY: s.raw is live; the preview's Full owner must survive a window release.
+    unsafe { uv_release_windows(s.raw) };
+    let after = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(after["fullSource"]["count"], 1);
+    assert_eq!(
+        after["fullResidency"]["gpuPixels"],
+        before["fullResidency"]["gpuPixels"]
+    );
+    let second = shot_at(&shots, preview(&s, &shots, 1280, false));
+    assert_eq!(second.rgba, first.rgba);
+}
+
+#[test]
+fn reduced_drafts_reuse_sources_and_keep_fit_and_odd_window_coverage() {
+    let shots = Arc::new(Shots::default());
+    let s = TestSession::new();
+    import_png(&s, &gradient_png(s.dir.path(), "draft.png", 1201, 801));
+    let full = shot_at(&shots, preview(&s, &shots, 1025, false));
+    let before = exec_ok(&s, "library.memory", "{}");
+    let uploads = lightcraft_gpu::source_uploads();
+    assert!(
+        before["previewResidency"]["gpuPixels"].as_u64().unwrap() > 0
+            || std::env::var_os("UNVEIL_REQUIRE_GPU").is_none()
+    );
+    for _ in 0..3 {
+        let draft = shot_at(&shots, preview(&s, &shots, 1025, true));
+        assert_eq!(draft.display, (full.width, full.height));
+        assert_eq!((draft.frame_width, draft.frame_height), draft.display);
+        assert_eq!(
+            (draft.width, draft.height),
+            (full.width.div_ceil(2), full.height.div_ceil(2))
+        );
+    }
+    let active = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(
+        active["unveil"]["previewStages"],
+        before["unveil"]["previewStages"]
+    );
+    assert_eq!(
+        active["previewResidency"]["readbacks"],
+        before["previewResidency"]["readbacks"]
+    );
+    assert_eq!(lightcraft_gpu::source_uploads(), uploads);
+    let settled = shot_at(&shots, preview(&s, &shots, 1025, false));
+    assert_eq!(settled.rgba, full.rgba);
+    let memory = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(
+        memory["unveil"]["previewStages"],
+        before["unveil"]["previewStages"]
+    );
+
+    let win = [101, 77, 301, 203];
+    let full = shot_at(&shots, window_with(&s, &shots, (1201, 801), win, false, true));
+    let window_memory = exec_ok(&s, "library.memory", "{}");
+    let draft = shot_at(&shots, window_with(&s, &shots, (1201, 801), win, true, true));
+    assert_eq!(draft.display, (301, 203));
+    assert_eq!(
+        (draft.x, draft.y, draft.frame_width, draft.frame_height),
+        (101, 77, full.frame_width, full.frame_height)
+    );
+    assert_eq!((draft.width, draft.height), (151, 102));
+    assert_eq!(
+        draft.histogram.as_ref().unwrap().total,
+        full.histogram.as_ref().unwrap().total
+    );
+    let settled = shot_at(&shots, window(&s, &shots, (1201, 801), win, false));
+    assert_eq!(settled.rgba, full.rgba);
+    let memory = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(
+        memory["unveil"]["windowStages"],
+        window_memory["unveil"]["windowStages"]
+    );
+
+    shot_at(&shots, preview(&s, &shots, 1025, true));
+    // SAFETY: the session is live and the render has completed before suspension.
+    assert_eq!(unsafe { uv_suspend(s.raw) }, 0);
+    let memory = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(
+        memory["unveil"]["previewStages"],
+        serde_json::json!({"cpu":0,"gpu":0})
+    );
+    assert_eq!(
+        memory["unveil"]["windowStages"],
+        serde_json::json!({"cpu":0,"gpu":0})
+    );
+    // SAFETY: restore the process-wide GPU preference for the remaining tests.
+    assert_eq!(unsafe { uv_resume(s.raw) }, 0);
 }
 
 #[test]
@@ -445,7 +552,7 @@ fn a_window_that_asks_carries_the_whole_photos_histogram() {
         let part = shot_at(&shots, window_with(&s, &shots, (1280, 1280), win, draft, true));
         assert!(part.window && !part.fallback, "not a window: {part:?}");
         let h = part.histogram.expect("a window that asked carried no histogram");
-        let expected = whole.height * 512 / whole.width;
+        let expected = whole.display.1 * 512 / whole.display.0;
         assert!(
             (expected..=expected + 1).any(|rows| h.total == 512 * rows),
             "sampled {} pixels, not a 512 px whole frame ({}x{} whole)",

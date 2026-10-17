@@ -752,10 +752,35 @@ fn windows_of_a_big_photo_share_one_uploaded_source() {
         lightcraft_gpu::render(&src, &info, &s, &at(x), Some(cache)).expect("gpu render");
     }
     assert_eq!(lightcraft_gpu::source_uploads() - start, 1, "one upload for five windows of two views");
-    assert!(lightcraft_gpu::shared_source_bytes() >= 280_000_000, "{}", lightcraft_gpu::shared_source_bytes());
+    let half_source = std::env::var("UNVEIL_E2_HALF").unwrap_or_else(|_| "off".into()) == "source"
+        && std::env::var_os("UNVEIL_E2_NO_F16").is_none()
+        && std::env::var_os("UNVEIL_E2_FAIL_HALF").is_none();
+    assert_eq!(lightcraft_gpu::shared_source_bytes(), if half_source { 144_000_000 } else { 288_000_000 });
     assert!(lightcraft_gpu::stage_bytes(&after) < 100 << 20, "and it is not in the views' stages");
     lightcraft_gpu::trim_pool(0);
     assert_eq!(lightcraft_gpu::shared_source_bytes(), 0, "an idle app gives it back");
     lightcraft_gpu::render(&src, &info, &s, &at(1000), Some(&after)).expect("gpu render");
     assert_eq!(lightcraft_gpu::source_uploads() - start, 2);
+}
+
+#[test]
+fn reduced_drafts_preserve_cpu_gpu_equivalence_and_full_cache() {
+    assert!(gpu(), "this acceptance run requires a GPU adapter");
+    let src = scene(2, 513, 341);
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let cache = StageCache::default();
+    for (name, edit) in cases() {
+        let mut settings = DevelopSettings::default();
+        edit(&mut settings);
+        for window in [None, Some(lightcraft_pipeline::PixelWindow { x: 51, y: 43, w: 173, h: 111 })] {
+            let native = RenderRequest { window, ..RenderRequest::fit(513, 341) };
+            let before = lightcraft_gpu::render(&src, &info, &settings, &native, Some(&cache)).expect("full before draft");
+            let request = RenderRequest { raster_scale: lightcraft_pipeline::RasterScale::Half, quality: Quality::Draft, ..native };
+            check(name, &src, &info, &settings, &request);
+            lightcraft_gpu::render(&src, &info, &settings, &request, Some(&cache)).expect("cached draft");
+            let after = lightcraft_gpu::render(&src, &info, &settings, &native, Some(&cache)).expect("full after draft");
+            assert_eq!(before.image.data, after.image.data, "draft poisoned full {name}");
+            assert_eq!(before.histogram, after.histogram, "draft poisoned full histogram {name}");
+        }
+    }
 }

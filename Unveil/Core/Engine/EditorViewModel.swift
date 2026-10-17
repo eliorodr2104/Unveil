@@ -237,7 +237,7 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
             return false
         }
 
-        return await enqueue { [engine, previewPixels] in
+        return await enqueue { [engine] in
             var previewGeneration: UInt64?
             defer { Signposts.openRequestedPreview(signpost, generation: previewGeneration) }
 
@@ -478,11 +478,11 @@ final class EditorViewModel<Engine: EngineDriving, Importer: PhotoImporting> {
     /// queued edit, so the window carries the newest settings. The canvas calls it as the view moves:
     /// at most every 100 ms during a gesture with `draft`, and once at full quality at rest.
     ///
-    /// A window costs the engine about a gigabyte at 100 % on a 24 MP raw: the decoded original on
-    /// the CPU, its copy on the GPU, the window's stages and pooled buffers. Once nil has held for
-    /// `windowReleaseDelay` the engine frees all but the decoded original, a budgeted cache entry
-    /// (`releaseWindows`), so a view back at fit returns near the fit footprint and the next zoom
-    /// decodes nothing; any window in between cancels that, so a quick zoom out and in keeps it all.
+    /// A window retains its full GPU original and render stages. Once nil has held for
+    /// `windowReleaseDelay`, `releaseWindows` drops the window stages and the full source unless
+    /// the fitted preview still uses it. A later full zoom decodes again after that release.
+    /// Any window in between cancels the delayed release, so a quick zoom out and in keeps the
+    /// existing source. The separate idle GPU-pool trim frees only reusable scratch buffers.
     /// The release goes straight to the engine: it orders nothing against the edits in the chain.
     func showWindow(_ window: FrameWindow?, draft: Bool) async {
         visibleWindow = window

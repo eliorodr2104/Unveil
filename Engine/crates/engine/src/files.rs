@@ -1,6 +1,11 @@
 //! Real files: probing (dimensions + metadata for import) and loading (decode → linear Rec.2020,
 //! oriented, downscaled to the requested level). Standard formats go through `lightcraft-codecs`,
 //! camera raws through `lightcraft-raw` (demosaic + DNG colour model).
+//! Modified for Unveil (2026-10-14): reuse bounded prepared sensor samples across preview and first full development.
+
+mod prepared;
+pub use lightcraft_raw::memory_trace as decode_memory;
+pub use prepared::{PreparedOpen, PreparedSources, PreparedStats};
 
 use std::sync::Arc;
 
@@ -9,7 +14,7 @@ use lightcraft_color::cct::xy_to_temp_tint;
 use lightcraft_geom::Orientation;
 use lightcraft_pipeline::SourceInfo;
 use lightcraft_raster::Rgb32f;
-use lightcraft_raster::resample::{Filter, fit};
+use lightcraft_raster::resample::{Filter, fit, fit_owned};
 
 use crate::media::{DenoiseSpec, FileLoader, FileProbe, PairLoader, PreviewLoader, ProbeInfo};
 
@@ -92,16 +97,20 @@ fn ext_upper(name: &str) -> String {
     std::path::Path::new(name).extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default()
 }
 
-/// Probe a file's bytes: kind, dimensions (oriented), metadata. No pixel data is decompressed:
-/// raws are described from their headers ([`lightcraft_raw::probe_info`]), other images too
+/// Probe a file's bytes: kind, dimensions (oriented), metadata. Most raws are described from
+/// their headers; some vendors read samples too ([`lightcraft_raw::probe_info`]). Other images use
 /// ([`lightcraft_codecs::read_header`], which refuses truncated files but can't see damage inside
 /// compressed data that is all there: such a file imports and shows as unreadable when rendered).
 pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
+    probe_bytes_from(name, bytes, None)
+}
+
+fn probe_bytes_from(name: &str, bytes: &[u8], prepared: Option<lightcraft_raw::Result<lightcraft_raw::RawInfo>>) -> Result<ProbeInfo, String> {
     let content_hash = Some(lightcraft_preview::hash_bytes(bytes).to_string());
     let m = lightcraft_meta::extract(bytes);
     let (meta, captured) = meta_of(&m);
     if lightcraft_raw::probe(bytes).is_some() {
-        let raw = match lightcraft_raw::probe_info(bytes).map_err(|e| preview_reason(bytes, e)) {
+        let raw = match prepared.unwrap_or_else(|| lightcraft_raw::probe_info(bytes)).map_err(|e| preview_reason(bytes, e)) {
             Ok(r) => r,
             Err(Ok(why)) => {
                 // a raw variant we can't decode yet: describe it from its embedded preview
@@ -262,8 +271,29 @@ fn load_bytes_now(
     max_edge: usize,
     denoise: Option<&DenoiseSpec>,
 ) -> Result<(Rgb32f, Option<Rgb32f>, SourceInfo), String> {
+    load_bytes_from(bytes, max_edge, denoise, None)
+}
+
+fn load_bytes_from(
+    bytes: std::borrow::Cow<'_, [u8]>,
+    max_edge: usize,
+    denoise: Option<&DenoiseSpec>,
+    mut prepared: Option<&mut prepared::Lease<'_>>,
+) -> Result<(Rgb32f, Option<Rgb32f>, SourceInfo), String> {
+    let file_memory = decode_memory::Allocation::new(
+        "file",
+        bytes.len(),
+        match &bytes {
+            std::borrow::Cow::Owned(v) => v.capacity(),
+            std::borrow::Cow::Borrowed(_) => 0,
+        },
+    );
     if lightcraft_raw::probe(&bytes).is_some() {
-        let mut raw = match lightcraft_raw::decode(&bytes).map_err(|e| preview_reason(&bytes, e)) {
+        let decoded = match prepared.as_mut() {
+            Some(source) => source.decode(&bytes),
+            None => lightcraft_raw::decode(&bytes),
+        };
+        let mut raw = match decoded.map_err(|e| preview_reason(&bytes, e)) {
             Ok(r) => r,
             Err(Ok(why)) => {
                 // show the camera's embedded JPEG (rendered, not raw) until the variant is supported
@@ -273,6 +303,13 @@ fn load_bytes_now(
             }
             Err(Err(e)) => return Err(e),
         };
+        let samples_memory = match &raw.data {
+            lightcraft_raw::RawData::U16(v) => decode_memory::Allocation::of("sensor-samples", v),
+            lightcraft_raw::RawData::F32(v) => decode_memory::Allocation::of("sensor-samples", v),
+        };
+        if let Some(source) = prepared.as_mut() {
+            source.capture_header(&mut raw);
+        }
         // Embedded lens corrections are applied by the pipeline ("Enable Profile Corrections"), not baked in
         // (removed before the camera look's binned sensor proxy too, which needs an empty `OpcodeList3`).
         let lens = embedded_lens(&raw.info());
@@ -282,6 +319,7 @@ fn load_bytes_now(
         // the source's segmentation mattes (DNG semantic masks), read while the preview is fitted
         let (camera_look, mattes) = rayon::join(|| crate::camera_preview::fit_preview(&raw, &bytes, &t), || dng_mattes(&bytes, &raw));
         drop(bytes);
+        drop(file_memory);
         // Previews and thumbnails bin the mosaic straight to (about) the size they need; only
         // larger levels (exports, 1:1) demosaic the whole sensor.
         let t0 = web_time::Instant::now();
@@ -299,9 +337,15 @@ fn load_bytes_now(
             }
         };
         // the same development from the denoised mosaic, when the photo has been denoised
+        let developed_memory = decode_memory::Allocation::of("developed-rgb", &img.data);
         let twin = denoise.and_then(|spec| denoised_camera_rgb(&raw, spec, factor)).filter(|d| d.width == img.width && d.height == img.height);
         // the samples aren't needed any more (the colour model below reads only the tags)
-        raw.data = lightcraft_raw::RawData::U16(Vec::new());
+        if let Some(source) = prepared.as_mut() {
+            source.samples_done(&mut raw);
+        } else {
+            raw.data = lightcraft_raw::RawData::U16(Vec::new());
+        }
+        samples_memory.handoff();
         let wb = t.wb;
         let m = camera_look.as_ref().map(|p| p.matrix.mul(&t.matrix)).unwrap_or(t.matrix).to_f32();
         let hue_sat = camera_look.as_ref().and_then(|p| p.hue_sat.as_ref()).and_then(crate::camera_preview::HueSat::new);
@@ -329,13 +373,15 @@ fn load_bytes_now(
                 hue_sat.as_ref().map_or(rgb, |h| h.apply(rgb)).map(|v| v.max(0.0))
             });
             stages.push(("colour", t0.elapsed()));
-            let img = fit(&img, max_edge, max_edge, Filter::Box);
+            let img = fit_owned(img, max_edge, max_edge, Filter::Box);
             stages.push(("fit", t0.elapsed()));
             let img = img.into_oriented(raw.orientation);
             stages.push(("orient", t0.elapsed()));
             (img, stages)
         };
         let (img, stages) = finish(img);
+        developed_memory.handoff();
+        let fitted_memory = decode_memory::Allocation::of("fitted-rgb", &img.data);
         if lightcraft_pipeline::profiling() {
             let mut prev = std::time::Duration::ZERO;
             let parts: Vec<String> = stages
@@ -359,6 +405,7 @@ fn load_bytes_now(
         });
         let camera_tone = camera_look.as_ref().map(|p| p.tone).or_else(|| raw.color.profile.tone_curve.as_ref().and_then(dng_tone_curve));
         let (temp, tint) = if relative { (6500.0, 0.0) } else { (temp.round(), tint.round()) };
+        fitted_memory.handoff();
         return Ok((
             img,
             twin,
@@ -367,6 +414,7 @@ fn load_bytes_now(
     }
     let d = lightcraft_codecs::decode(&bytes, fit_box(max_edge)).map_err(|e| e.to_string())?;
     drop(bytes);
+    drop(file_memory);
     let img = d.to_working();
     let img = if img.width.max(img.height) > max_edge { fit(&img, max_edge, max_edge, Filter::Mitchell) } else { img };
     Ok((img.into_oriented(Orientation::from_exif(d.orientation)), None, SourceInfo::default()))
@@ -550,7 +598,49 @@ pub fn fs_hooks() -> (FileLoader, FileProbe) {
     (loader, probe)
 }
 
+/// Filesystem hooks with one explicitly selected prepared source. The caller owns open/cancel/pressure
+/// transitions on `sources`; ordinary fs_hooks and folder imports retain their existing behavior.
+pub fn fs_hooks_with_prepared(sources: Arc<PreparedSources>) -> (FileLoader, FileProbe) {
+    let loading = sources.clone();
+    let loader: FileLoader = Arc::new(move |path: &str, max_edge: usize| {
+        let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
+        let weight = len.saturating_mul(if max_edge <= crate::media::SourceLevel::Thumb.max_edge() { 3 } else { 6 });
+        let gate = crate::memory::work_gate();
+        let _permit = if crate::memory::is_background() { gate.acquire(weight) } else { gate.acquire_urgent(weight) };
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let result = loading.load(path, bytes, max_edge);
+        crate::memory::release();
+        result
+    });
+    let probe: FileProbe = Arc::new(move |path: &str| {
+        let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
+        let _permit = crate::memory::work_gate().acquire(len);
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        sources.probe(path, &bytes)
+    });
+    (loader, probe)
+}
+
 impl crate::Session {
+    /// Install filesystem hooks with explicit interactive preparation controlled by the host.
+    pub fn with_prepared_fs(mut self, sources: Arc<PreparedSources>) -> Self {
+        let (loader, probe) = fs_hooks_with_prepared(sources.clone());
+        self.media.file_loader = Some(loader);
+        self.media.file_probe = Some(probe);
+        self.media.preview_loader = Some(fs_preview_loader());
+        self.media.denoise.loader = Some(Arc::new(move |path, max_edge, spec| {
+            let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
+            let weight = len.saturating_mul(if max_edge <= crate::media::SourceLevel::Thumb.max_edge() { 4 } else { 10 });
+            let gate = crate::memory::work_gate();
+            let _permit = if crate::memory::is_background() { gate.acquire(weight) } else { gate.acquire_urgent(weight) };
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            let result = sources.load_pair(path, bytes, max_edge, spec);
+            crate::memory::release();
+            result
+        }));
+        self
+    }
+
     /// Install the filesystem file hooks (desktop, CLI, MCP headless).
     pub fn with_fs(mut self) -> Self {
         let (l, p) = fs_hooks();
@@ -561,6 +651,9 @@ impl crate::Session {
         self
     }
 }
+
+#[cfg(test)]
+mod prepared_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: immutable sources and mapped display output; see Engine/CHANGES.md.
 //! The LightCraft develop pipeline on the GPU (wgpu compute, WGSL kernels).
 //!
 //! The CPU pipeline (`lightcraft-pipeline`) is the reference: every kernel here is a port of a CPU
@@ -25,6 +26,13 @@ use lightcraft_develop::DevelopSettings;
 use lightcraft_pipeline::{RenderRequest, Rendered, SourceInfo, StageCache};
 use lightcraft_raster::Rgb32f;
 
+mod pool_stats;
+pub use pool_stats::{PoolStats, pool_stats, set_pool_diagnostics};
+mod output;
+pub use output::DisplayImage;
+mod source;
+pub use source::{GpuSource, SourceFault, SourceStorage, inject_source_fault, upload_source, upload_source_with_storage};
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod backend;
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,6 +41,8 @@ mod ctx;
 pub mod nn;
 #[cfg(not(target_arch = "wasm32"))]
 mod params;
+#[cfg(not(target_arch = "wasm32"))]
+mod reduced_stats;
 #[cfg(not(target_arch = "wasm32"))]
 mod render;
 
@@ -267,15 +277,38 @@ pub fn memory() -> GpuMemory {
     }
 }
 
+/// Current byte limit for reusable storage, excluding live and retired buffers.
+pub fn pool_limit() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        ctx::POOL_LIMIT.load(Ordering::Relaxed)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
+}
+
 /// Keep at most `bytes` of recycled buffers in the free pool from now on (trimming it now).
 pub fn set_pool_limit(bytes: u64) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         ctx::POOL_LIMIT.store(bytes, Ordering::Relaxed);
-        trim_pool(bytes);
+        trim_reusable(bytes);
     }
     #[cfg(target_arch = "wasm32")]
     let _ = bytes;
+}
+
+/// Discard only free buffers. Live stages and originals, including the legacy shared source,
+/// stay valid. This operation does not wait for GPU work or touch unsubmitted retired buffers.
+pub fn trim_reusable(keep: u64) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(g) = existing_device() {
+        g.trim(keep);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = keep;
 }
 
 /// Free recycled buffers until at most `keep` bytes stay pooled (e.g. when the app goes idle).
@@ -303,7 +336,8 @@ pub fn shared_source_bytes() -> usize {
     }
 }
 
-/// Big sources uploaded to the shared copy so far (a diagnostic: one big photo is uploaded once, not once per window).
+/// Original source uploads so far, including resident sources and legacy callers. Reused handles
+/// do not increment this counter when a different window or histogram size is rendered.
 pub fn source_uploads() -> u64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -331,6 +365,35 @@ pub fn stage_bytes(stages: &StageCache) -> usize {
 /// Render `src` with `s` on the GPU, reusing the device-resident stages kept with `stages` (the
 /// view's CPU stage cache). `None`: render on the CPU instead.
 pub fn render(src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, stages: Option<&StageCache>) -> Option<Rendered> {
+    let rendered = render_output(src, info, s, req, stages, false)?;
+    Some(Rendered {
+        display_size: rendered.display_size,
+        image: rendered.image.into_owned().ok()?,
+        histogram: rendered.histogram,
+        deep: rendered.deep,
+    })
+}
+
+/// Render display output without allocating an intermediate CPU RGBA image. Diagnostic overlays
+/// retain owned pixels; device validation and fallback rules are identical to [`render`].
+pub fn render_mapped(
+    src: &Arc<Rgb32f>,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    stages: Option<&StageCache>,
+) -> Option<Rendered<DisplayImage>> {
+    render_output(src, info, s, req, stages, true)
+}
+
+fn render_output(
+    src: &Arc<Rgb32f>,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    stages: Option<&StageCache>,
+    retain_mapping: bool,
+) -> Option<Rendered<DisplayImage>> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         // sections switched off with their eye render as if at their defaults (issue #316)
@@ -341,66 +404,170 @@ pub fn render(src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &R
             return None;
         }
         let gpu = device()?;
-        let ext = stages.map(|c| c.extension::<GpuStages>());
-        let fault = take_fault();
-        let _ = ctx::take_failure(); // nothing left over from an earlier render on this thread
-        let (r, scoped) = {
-            let _scope = ctx::RenderScope::new(gpu);
-            let errors = ctx::ErrorScopes::push(gpu);
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render::render(gpu, src, info, s, req, ext.as_deref(), fault)));
-            (r, errors.pop())
-        };
-        // An error the device raised explains the readback failures that follow it; a buffer
-        // over the limit explains the errors its placeholder raises.
-        let failure = match (ctx::take_failure(), scoped) {
-            (Some(f), _) if f.kind == ctx::FailKind::Limit => Some(f),
-            (f, scoped) => scoped.or(f),
-        };
-        match (r, failure) {
-            (Err(_), _) => {
-                log::error!("gpu: render failed; using the CPU pipeline from now on");
-                mark_broken("a GPU render panicked");
-                record_fallback("a GPU render panicked; the GPU is not used again".into());
-                None
-            }
-            (Ok(r), Some(f)) => {
-                // the view's cached device stages may hold results of the failed passes
-                if let Some(e) = &ext {
-                    e.clear();
-                }
-                let what = match &r {
-                    Some(r) => format!("{}×{}", r.image.width, r.image.height),
-                    None => "GPU render".into(),
-                };
-                let reason = match f.kind {
-                    ctx::FailKind::Fatal => {
-                        mark_broken(&f.reason);
-                        format!("{what}: {}; the GPU is not used again", f.reason)
-                    }
-                    ctx::FailKind::OutOfMemory => {
-                        gpu.trim(0);
-                        format!("{what}: {}", f.reason)
-                    }
-                    ctx::FailKind::Limit | ctx::FailKind::Blank => format!("{what}: {}", f.reason),
-                };
-                log::warn!("gpu: rendering on the CPU instead: {reason}");
-                if render::profiling() {
-                    eprintln!("  gpu fallback to the CPU: {reason}");
-                }
-                record_fallback(reason);
-                None
-            }
-            // a device error on another thread or a lost device during the render
-            (Ok(Some(_)), None) if BROKEN.load(Ordering::Relaxed) => {
-                record_fallback(format!("device failure during the render: {}", unavailable_reason().unwrap_or_default()));
-                None
-            }
-            (Ok(r), None) => r,
-        }
+        guarded_render(gpu, stages, |ext, fault| render::render(gpu, src, info, s, req, ext, fault, retain_mapping))
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (src, info, s, req, stages);
+        let _ = (src, info, s, req, stages, retain_mapping);
         None
+    }
+}
+
+/// render_prepared renders a resident original with a resolved metadata/pixel-facts plan. A
+/// successful result permits the engine to release its CPU original; failures preserve the
+/// caller's CPU fallback or reload path. No original CPU pixels are needed or retained here.
+/// After a failure, `source.storage_policy()` distinguishes a required exact f32 retry from
+/// other GPU failures. Preserve that policy across exact recovery and replacement uploads.
+pub fn render_prepared(
+    source: &Arc<GpuSource>,
+    info: &SourceInfo,
+    plan: &lightcraft_pipeline::Plan<'_>,
+    req: &RenderRequest,
+    stages: Option<&StageCache>,
+    mapped: bool,
+) -> Option<Rendered<DisplayImage>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if !enabled() || req.depth != lightcraft_pipeline::OutputDepth::U8 || req.proof.is_some() {
+            return None;
+        }
+        let gpu = source.device().ok()?;
+        let result = guarded_render(gpu, stages, |ext, fault| render::render_prepared(gpu, source, info, plan, req, ext, fault, mapped));
+        if result.is_some()
+            && let Some(cache) = stages
+        {
+            cache.clear_cpu();
+            if let Some(stages) = cache.peek_extension::<GpuStages>() {
+                stages.adopt_source(source);
+            }
+        }
+        result
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (source, info, plan, req, stages, mapped);
+        None
+    }
+}
+
+/// guarded_render applies the same device failure policy to legacy and resident rendering.
+#[cfg(not(target_arch = "wasm32"))]
+fn guarded_render(
+    gpu: &ctx::Gpu,
+    stages: Option<&StageCache>,
+    render: impl FnOnce(Option<&GpuStages>, Option<Fault>) -> Option<Rendered<DisplayImage>>,
+) -> Option<Rendered<DisplayImage>> {
+    let ext = stages.map(|c| c.extension::<GpuStages>());
+    let fault = take_fault();
+    let _ = ctx::take_failure(); // nothing left over from an earlier render on this thread
+    let (r, scoped) = {
+        let _scope = ctx::RenderScope::new(gpu);
+        let errors = ctx::ErrorScopes::push(gpu);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render(ext.as_deref(), fault)));
+        (r, errors.pop())
+    };
+    // An error the device raised explains the readback failures that follow it; a buffer
+    // over the limit explains the errors its placeholder raises.
+    let failure = match (ctx::take_failure(), scoped) {
+        (Some(f), _) if f.kind == ctx::FailKind::Limit => Some(f),
+        (f, scoped) => scoped.or(f),
+    };
+    match (r, failure) {
+        (Err(_), _) => {
+            if let Some(stages) = &ext {
+                stages.clear();
+            }
+            render::release_shared_source();
+            log::error!("gpu: render failed; using the CPU pipeline from now on");
+            mark_broken("a GPU render panicked");
+            record_fallback("a GPU render panicked; the GPU is not used again".into());
+            None
+        }
+        (Ok(r), Some(f)) => {
+            // the view's cached device stages may hold results of the failed passes
+            if let Some(e) = &ext {
+                e.clear();
+            }
+            let what = match &r {
+                Some(r) => format!("{}×{}", r.image.width, r.image.height),
+                None => "GPU render".into(),
+            };
+            let reason = match f.kind {
+                ctx::FailKind::Fatal => {
+                    render::release_shared_source();
+                    mark_broken(&f.reason);
+                    format!("{what}: {}; the GPU is not used again", f.reason)
+                }
+                ctx::FailKind::OutOfMemory => {
+                    gpu.trim(0);
+                    format!("{what}: {}", f.reason)
+                }
+                ctx::FailKind::Limit | ctx::FailKind::Blank | ctx::FailKind::Precision => format!("{what}: {}", f.reason),
+            };
+            log::warn!("gpu: rendering on the CPU instead: {reason}");
+            if render::profiling() {
+                eprintln!("  gpu fallback to the CPU: {reason}");
+            }
+            record_fallback(reason);
+            None
+        }
+        // a device error on another thread or a lost device during the render
+        (Ok(Some(_)), None) if BROKEN.load(Ordering::Relaxed) => {
+            if let Some(stages) = &ext {
+                stages.clear();
+            }
+            render::release_shared_source();
+            record_fallback(format!("device failure during the render: {}", unavailable_reason().unwrap_or_default()));
+            None
+        }
+        (Ok(r), None) => r,
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod source_failure_tests {
+    #[test]
+    fn invalid_and_over_limit_sources_never_upload() {
+        if !super::available() {
+            eprintln!("skipped: no GPU adapter for source validation");
+            return;
+        }
+        let uploads = super::source_uploads();
+        for image in [
+            lightcraft_raster::Rgb32f { width: 0, height: 3, data: lightcraft_raster::Buffer::Heap(Vec::new()) },
+            lightcraft_raster::Rgb32f { width: usize::MAX, height: 2, data: lightcraft_raster::Buffer::Heap(Vec::new()) },
+            lightcraft_raster::Rgb32f { width: 3, height: 2, data: vec![[0.5; 3]; 5].into() },
+        ] {
+            assert!(super::upload_source(lightcraft_pipeline::SourceId::new(), &image).is_err());
+        }
+        {
+            let _limit = super::ctx::LimitOverride::new(32);
+            let image = lightcraft_raster::Rgb32f { width: 3, height: 1, data: vec![[0.5; 3]; 3].into() };
+            assert!(super::upload_source(lightcraft_pipeline::SourceId::new(), &image).is_err());
+        }
+        assert_eq!(super::source_uploads(), uploads, "validation must reject the source before allocating an upload");
+        assert!(super::enabled(), "invalid input must not disable a healthy device");
+    }
+
+    #[test]
+    fn a_render_panic_discards_cached_gpu_ownership() {
+        let Some(gpu) = super::device() else {
+            eprintln!("skipped: no GPU adapter for panic cleanup");
+            return;
+        };
+        let image = std::sync::Arc::new(lightcraft_scenes::demo_library()[2].render(101, 79));
+        let stages = lightcraft_pipeline::StageCache::default();
+        super::render(
+            &image,
+            &lightcraft_pipeline::SourceInfo::default(),
+            &lightcraft_develop::DevelopSettings::default(),
+            &lightcraft_pipeline::RenderRequest::fit(83, 61),
+            Some(&stages),
+        )
+        .unwrap();
+        assert!(super::stage_bytes(&stages) > 0);
+        assert!(super::guarded_render(gpu, Some(&stages), |_, _| panic!("injected render panic")).is_none());
+        assert_eq!(super::stage_bytes(&stages), 0, "CPU fallback must not leave failed GPU stages retained");
+        super::reset_failures();
     }
 }

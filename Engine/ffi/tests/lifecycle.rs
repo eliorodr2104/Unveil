@@ -198,6 +198,11 @@ fn suspend_releases_every_gpu_buffer() {
     // SAFETY: s.raw is live.
     assert_eq!(unsafe { uv_resume(s.raw) }, 0);
     if !lightcraft_gpu::available() {
+        assert!(
+            std::env::var_os("UNVEIL_REQUIRE_GPU").is_none(),
+            "GPU suspension validation requires an adapter: {:?}",
+            lightcraft_gpu::unavailable_reason()
+        );
         eprintln!("skipped: no GPU adapter");
         return;
     }
@@ -205,11 +210,17 @@ fn suspend_releases_every_gpu_buffer() {
     preview_with_exposure(&s, &pixels, 0.5);
     let before = lightcraft_gpu::memory();
     assert!(before.allocated > 0, "the preview left no GPU buffer: {before:?}");
+    let owners = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(owners["previewResidency"]["cpuPixels"], 0);
+    assert!(owners["previewResidency"]["gpuPixels"].as_u64().unwrap() > 0);
 
     // SAFETY: s.raw is live.
     assert_eq!(unsafe { uv_suspend(s.raw) }, 0, "{}", last_error());
     let after = lightcraft_gpu::memory();
     assert_eq!(after.allocated, 0, "GPU buffers survived uv_suspend: {after:?}");
+    let owners = exec_ok(&s, "library.memory", "{}");
+    assert_eq!(owners["previewResidency"]["gpuPixels"], 0);
+    assert_eq!(owners["fullSource"]["count"], 0);
 }
 
 #[test]

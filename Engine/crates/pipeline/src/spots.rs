@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: exact planning without a retained CPU original; see Engine/CHANGES.md.
 //! Remove / Heal / Clone spots, rendered at output resolution in scene-linear light.
 //!
 //! - **Clone** copies the source patch with a feathered edge.
@@ -93,6 +94,12 @@ pub fn pick_source(
         return None;
     }
     let img = frame.sample(src, w, h);
+    pick_source_from_proxy(&img, &frame, spot, avoid)
+}
+
+/// The same source selection over the fixed-size frame sample, retained independently of the original.
+pub(crate) fn pick_source_from_proxy(img: &Rgb32f, frame: &Frame, spot: &Spot, avoid: Option<Point>) -> Option<Point> {
+    let (w, h) = (img.width, img.height);
     let (to_out, to_norm) = (frame.norm_to_out(w, h), frame.out_to_norm(w, h));
     let t = to_out.apply(*spot.points.first()?);
     let r = (spot.size * frame.px_per_long(w)).max(1.0) as f32;
@@ -101,7 +108,7 @@ pub fn pick_source(
         ((b.x - a.x) as f32, (b.y - a.y) as f32)
     });
     let far = |d: &(f32, f32)| avoid.is_none_or(|a| ((d.0 - a.0).powi(2) + (d.1 - a.1).powi(2)).sqrt() > r);
-    let d = ranked_sources(&img, (t.x as f32, t.y as f32), r).into_iter().find(far)?;
+    let d = ranked_sources(img, (t.x as f32, t.y as f32), r).into_iter().find(far)?;
     let (n0, n1) = (to_norm.apply(t), to_norm.apply(Point::new(t.x + d.0 as f64, t.y + d.1 as f64)));
     Some(Point::new(n1.x - n0.x, n1.y - n0.y))
 }
@@ -302,7 +309,7 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
                 height: bh,
                 data: tgt.iter().zip(&src).zip(&outside).map(|((t, s), m)| [(t[0] - s[0]) * m, (t[1] - s[1]) * m, (t[2] - s[2]) * m]).collect(),
             };
-            let wts = lightcraft_raster::Plane { width: bw, height: bh, data: outside };
+            let wts = lightcraft_raster::Plane { width: bw, height: bh, data: outside.into() };
             let sigma = (r * 0.6).max(1.0);
             let (bd, bm) = (lightcraft_raster::blur::gaussian(&diff, sigma), lightcraft_raster::blur::gaussian(&wts, sigma));
             Some(Rgb32f {

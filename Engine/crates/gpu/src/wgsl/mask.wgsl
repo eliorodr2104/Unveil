@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: half storage with explicit f32 loads; see Engine/CHANGES.md.
 // Mask evaluation (`lightcraft_pipeline::masks`): one component shape → `c`, then combined into
 // the mask's alpha plane. Bindings: img (rgb, pre-exposure), log_l, aux (shape data), c, alpha.
 
@@ -15,7 +16,7 @@ fn pos(x: u32, y: u32) -> vec2<f32> {
 //   4 brush: stroke count (stroke records + dabs in aux)
 // `masks::chromaticity` of pixel i.
 fn chroma_at(i: u32) -> vec3<f32> {
-    let c = vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]);
+    let c = vec3<f32>(load_img(3u * i), load_img(3u * i + 1u), load_img(3u * i + 2u));
     return c / max(lum2020(c), 1e-6);
 }
 
@@ -60,12 +61,12 @@ fn shape(@builtin(global_invocation_id) g: vec3<u32>) {
     } else if (kind == 2u) {
         let lo = pf(10u);
         let hi = pf(11u);
-        let y = clamp((log_l[i] + pf(14u) + 8.0) / 12.0, 0.0, 1.0);
+        let y = clamp((load_log_l(i) + pf(14u) + 8.0) / 12.0, 0.0, 1.0);
         v = sstep(lo - pf(12u), lo, y) * (1.0 - sstep(hi, hi + pf(13u), y));
     } else if (kind == 3u) {
         let tol = pf(10u);
         let gain = pf(11u);
-        let c = vec3<f32>(img[3u * i], img[3u * i + 1u], img[3u * i + 2u]) * gain;
+        let c = vec3<f32>(load_img(3u * i), load_img(3u * i + 1u), load_img(3u * i + 2u)) * gain;
         let lab = oklab(c / (1.0 + c));
         var best = 3.402823e38;
         for (var k = 0u; k < pu(12u); k++) {
@@ -80,7 +81,7 @@ fn shape(@builtin(global_invocation_id) g: vec3<u32>) {
         // stroke record: dab offset, dab count, r, hard, flow, density, erase, bbox x0 y0 x1 y1, auto
         let px = f32(g.x) + 0.5;
         let py = f32(g.y) + 0.5;
-        let lp = log_l[i];
+        let lp = load_log_l(i);
         let chp = chroma_at(i);
         for (var k = 0u; k < pu(10u); k++) {
             let o = 12u * k;
@@ -109,7 +110,7 @@ fn shape(@builtin(global_invocation_id) g: vec3<u32>) {
                     let rx = min(u32(max(floor(aux[off + 2u * j]), 0.0)), w - 1u);
                     let ry = min(u32(max(floor(aux[off + 2u * j + 1u]), 0.0)), h - 1u);
                     let ri = ry * w + rx;
-                    a *= auto_similarity(lp, chp, log_l[ri], chroma_at(ri));
+                    a *= auto_similarity(lp, chp, load_log_l(ri), chroma_at(ri));
                 }
                 keep *= 1.0 - a * flow;
             }

@@ -5,6 +5,7 @@ use unveil_ffi::*;
 
 fn preview(s: &TestSession, frames: &Arc<Frames>, max: u32) {
     // SAFETY: s.raw is live; frames is declared before s by every caller, so it outlives the session.
+    // SAFETY: the session and callback context remain alive until this frame is delivered.
     let generation = unsafe {
         uv_request_preview(
             s.raw,
@@ -83,4 +84,45 @@ fn the_diagnostics_are_off_until_enabled_and_then_count_loads_and_renders() {
         count(&exec(&s, "unveil.renders", "{}").unwrap(), "render", "fit-full"),
         0
     );
+
+    // A draft has no owned view-cache image. Count its actual output path, including CPU fallback.
+    exec(&s, "unveil.diagnostics", r#"{"enabled":true}"#).unwrap();
+    let generation = unsafe {
+        uv_request_preview(
+            s.raw,
+            128,
+            true,
+            false,
+            Some(record),
+            Arc::as_ptr(&frames) as *mut _,
+        )
+    };
+    assert!(generation > 0);
+    wait_for(&frames, 4);
+    let renders = exec(&s, "unveil.renders", r#"{"reset":true}"#).unwrap();
+    let output = renders["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["category"] == "fit-draft")
+        .unwrap();
+    let physical = output["physicalPixels"].as_u64().unwrap();
+    let display = output["displayPixels"].as_u64().unwrap();
+    assert!(physical > 0, "{output}");
+    assert_eq!(
+        physical * 4,
+        display,
+        "even-sized reduced output must have one quarter of the pixels: {output}"
+    );
+    let mapped = output["mapped"].as_u64().unwrap();
+    let owned = output["owned"].as_u64().unwrap();
+    assert_eq!(mapped + owned, 1, "{renders}");
+    if std::env::var_os("UNVEIL_REQUIRE_GPU").is_some() {
+        assert_eq!(
+            mapped, 1,
+            "the physical GPU path must retain its mapping: {renders}"
+        );
+        assert_eq!(owned, 0, "{renders}");
+    }
+    assert_eq!(output["mappedPixelBytes"], physical * 4 * mapped, "{renders}");
 }

@@ -458,8 +458,9 @@ nonisolated final class EngineManager:
 
     /// receiveFrame is the C callback of both requests, on the engine thread. It cannot capture: it
     /// reaches the sink through `ctx`, unretained because the manager owns the sink and deinit keeps
-    /// it alive until the session is freed.
-    private static let receiveFrame: uv_frame_cb = { context, frame in
+    /// it alive until the session is freed. Internal so the C delivery contract can be tested
+    /// without creating a session or invoking a render.
+    static let receiveFrame: uv_frame_cb = { context, frame in
         guard let context, let frame else { return }
 
         let info = frame.pointee
@@ -483,8 +484,8 @@ nonisolated final class EngineManager:
             frameHeight : Int(info.frame_height),
             x           : Int(info.x),
             y           : Int(info.y),
-            width       : Int(info.width),
-            height      : Int(info.height)
+            width       : Int(info.display_width),
+            height      : Int(info.display_height)
         ) : nil
 
         OpenTimeline.mark("frame-delivered gen \(info.generation) \(info.window ? "window" : "fit") draft \(info.draft)")
@@ -500,7 +501,9 @@ nonisolated final class EngineManager:
             replacesWindow: info.fallback,
             nativeWidth   : Int(info.native_width),
             nativeHeight  : Int(info.native_height),
-            histogram     : info.histogram.map { EngineManager.histogram(of: $0.pointee, frame: info) }
+            histogram     : info.histogram.map { EngineManager.histogram(of: $0.pointee, frame: info) },
+            displayWidth  : Int(info.display_width),
+            displayHeight : Int(info.display_height)
         )
     }
 

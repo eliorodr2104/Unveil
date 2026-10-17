@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: stamp import jobs with source lifetime and precision policy; see Engine/CHANGES.md.
 //! Import: files and folders (recursive) → photos.
 //!
 //! 1. Expand folders recursively into supported files (hidden entries and the library's own
@@ -1360,6 +1361,8 @@ impl Session {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
             source_key: None,
+            source_epoch: self.media.source_epoch(level),
+            source_policy: Default::default(),
             photo: id,
             level,
             source,

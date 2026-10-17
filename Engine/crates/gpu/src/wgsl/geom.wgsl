@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: half storage with explicit f32 loads; see Engine/CHANGES.md.
 // Geometry (`lightcraft_pipeline::geometry::Frame::sample`): orientation, and the single bilinear
 // resample through the crop/straighten/flip affine or the full lens + perspective warp.
 // Bindings: src (rgb), dst (rgb).
@@ -6,7 +7,7 @@ fn src_px(w: u32, h: u32, x: i32, y: i32) -> vec3<f32> {
     let cx = u32(clamp(x, 0, i32(w) - 1));
     let cy = u32(clamp(y, 0, i32(h) - 1));
     let j = 3u * (cy * w + cx);
-    return vec3<f32>(src[j], src[j + 1u], src[j + 2u]);
+    return vec3<f32>(load_src(j), load_src(j + 1u), load_src(j + 2u));
 }
 
 // `Rgb32f::sample_bilinear` (pixel centres at +0.5, clamped edges).
@@ -50,7 +51,7 @@ fn orient(@builtin(global_invocation_id) g: vec3<u32>) {
     let sx = u32(m[0] * x + m[1] * y + m[2]);
     let sy = u32(m[3] * x + m[4] * y + m[5]);
     let j = 3u * (sy * sw + sx);
-    put(g.y * ow + g.x, vec3<f32>(src[j], src[j + 1u], src[j + 2u]));
+    put(g.y * ow + g.x, vec3<f32>(load_src(j), load_src(j + 1u), load_src(j + 2u)));
 }
 
 // Bilinear resample through an affine (output px → base px). P: bw, bh, w, h, affine[6].

@@ -1,3 +1,4 @@
+// Modified by the Unveil authors, 2026: share exact bounded frame analysis; see Engine/CHANGES.md.
 //! Upright: automatic perspective correction.
 //!
 //! 1. **Line segments** — our own gradient-based detector: pixels with a strong luminance gradient are grown into
@@ -539,18 +540,29 @@ const ANALYSIS_LONG: usize = 1024;
 /// Analyse a source: the lens-corrected (optics applied, no perspective/crop) image at [`ANALYSIS_LONG`] px,
 /// segment detection and vanishing points. Cached per source + optics settings.
 pub fn analyze_source(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings) -> Analysis {
-    static CACHE: Mutex<Vec<(u64, Analysis)>> = Mutex::new(Vec::new());
+    static CACHE: Mutex<Vec<((u64, String), Analysis)>> = Mutex::new(Vec::new());
     let mut base = s.clone();
     base.geometry = Geometry::default();
     base.crop = Crop::default();
-    let key = crate::optics::fingerprint(src)
-        ^ lightcraft_develop::DevelopSettings { optics: s.optics, orientation: s.orientation, ..Default::default() }.hash64().rotate_left(17);
+    let frame = crate::frame_for(src, info, &base, false);
+    let key = (crate::optics::fingerprint(src), format!("{frame:?}"));
     if let Ok(c) = CACHE.lock()
         && let Some((_, a)) = c.iter().find(|(k, _)| *k == key)
     {
         return a.clone();
     }
-    let frame = crate::frame_for(src, info, &base, false);
+    let a = analyze_frame(src, &frame);
+    if let Ok(mut c) = CACHE.lock() {
+        c.push((key, a.clone()));
+        if c.len() > 8 {
+            c.remove(0);
+        }
+    }
+    a
+}
+
+/// Analyze the exact prepared frame without retaining the source or using a global identity cache.
+pub(crate) fn analyze_frame(src: &Rgb32f, frame: &crate::geometry::Frame) -> Analysis {
     let (w, h) = frame.fit(ANALYSIS_LONG, ANALYSIS_LONG);
     let img = frame.sample(src, w, h);
     // perceptual lightness, normalized to the image's bright end
@@ -559,14 +571,7 @@ pub fn analyze_source(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings) -> A
     v.sort_by(f32::total_cmp);
     let white = v.get(v.len() * 99 / 100).copied().unwrap_or(1.0).max(1e-4);
     let lum = lum.map(|x| (x.max(0.0) / white).min(1.5).powf(1.0 / 2.4));
-    let a = analyze(&detect_segments(&lum));
-    if let Ok(mut c) = CACHE.lock() {
-        c.push((key, a.clone()));
-        if c.len() > 8 {
-            c.remove(0);
-        }
-    }
-    a
+    analyze(&detect_segments(&lum))
 }
 
 /// The rotation (degrees, clockwise +) that levels `src`'s dominant horizon/plumb lines, if they agree

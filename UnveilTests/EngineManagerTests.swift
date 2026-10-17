@@ -281,11 +281,24 @@ struct EngineManagerTests {
     }
 
     @Test
-    func previewWhileSuspendedIsRefused() async throws {
+    func suspendedPreviewIsRefusedAndResumeRestoresPixels() async throws {
         let manager = try makeManager(maxPixels: 256)
         let fixture = try fixtureURL()
         defer { try? FileManager.default.removeItem(at: fixture) }
         _ = try await manager.openPhoto(at: fixture)
+
+        let first = try manager.requestPreview(
+            maxPixels : 256,
+            draft     : false,
+            before    : false
+        )
+        try await waitUntil(seconds: 30) { (manager.frames.latest()?.generation ?? 0) >= first }
+        let before = try #require(manager.frames.latest())
+        let buffer = manager.frames.buffer(at: before.bufferIndex)
+        // Copy only pixel bytes while no further render can replace this published buffer.
+        let pixels = (0 ..< before.height).map { row in
+            Data(bytes: buffer.contents() + row * before.bytesPerRow, count: before.width * 4)
+        }
         try manager.suspend()
 
         #expect(throws: EngineError.suspended("the session is suspended")) {
@@ -296,6 +309,22 @@ struct EngineManagerTests {
             )
         }
         try manager.resume()
+
+        let resumed = try manager.requestPreview(
+            maxPixels : 256,
+            draft     : false,
+            before    : false
+        )
+        try await waitUntil(seconds: 30) { (manager.frames.latest()?.generation ?? 0) >= resumed }
+        let after = try #require(manager.frames.latest())
+        #expect(after.width == before.width && after.height == before.height)
+        #expect(after.nativeWidth == before.nativeWidth && after.nativeHeight == before.nativeHeight)
+        #expect(!after.isDraft)
+        let restored = manager.frames.buffer(at: after.bufferIndex)
+        let restoredPixels = (0 ..< after.height).map { row in
+            Data(bytes: restored.contents() + row * after.bytesPerRow, count: after.width * 4)
+        }
+        #expect(restoredPixels == pixels)
     }
 
     @Test
