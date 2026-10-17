@@ -1,3 +1,4 @@
+// Modified for Unveil (2026-10-17): absent optional fonts are valid; explicitly required fonts must fail the build.
 //! Optional build input: with `CRAFT_FONTS_DIR=<storytold/craft-fonts checkout>`, embed every font
 //! in its `fonts/manifest.txt` as `CRAFT_FONTS` (see src/fonts.rs). Unset, `CRAFT_FONTS` is empty.
 //! Recipe from craft-fonts' docs/integration.md; craft-fonts is never a Cargo dependency, and this
@@ -28,11 +29,11 @@ fn main() {
         }
     }
     src.push_str("];\n");
-    // Without them the app still runs and every language still selectable, so Chinese and Japanese
-    // just paint boxes — the one failure a user cannot diagnose from what they see.
-    if embedded == 0 {
+    // Hosts that render CJK text with these fonts must opt into the required input. Native hosts
+    // such as Unveil use the platform's UI fonts; an absent optional engine font set is valid.
+    if embedded == 0 && std::env::var_os("CRAFT_FONTS_REQUIRED").is_some() {
         println!(
-            "cargo::warning=no craft-fonts embedded: Chinese and Japanese text will render as empty boxes. \
+            "cargo::error=CRAFT_FONTS_REQUIRED is set but no craft-fonts were embedded. \
              Clone https://github.com/storytold/craft-fonts next to this repo and rebuild with \
              CRAFT_FONTS_DIR=../craft-fonts"
         );

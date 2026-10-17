@@ -505,7 +505,7 @@ nonisolated enum PhotoThumbnails {
 
     /// manager is shared by every cell. PHImageManager is documented as safe to use from any
     /// thread, which is what lets a cancelled stream cancel its request from its own context.
-    nonisolated(unsafe) private static let manager = PHCachingImageManager()
+    private static let manager = PHCachingImageManager()
 
     /// images yields the opportunistic low-quality image, then the final one, and ends; ending
     /// the iteration early cancels the request.
